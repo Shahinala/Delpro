@@ -28,7 +28,11 @@ import {
   RefreshCw,
   Bell,
   BellOff,
-  CheckCircle2
+  CheckCircle2,
+  Loader2,
+  Sparkles,
+  Volume2,
+  HardDrive
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -44,6 +48,8 @@ import {
 import { format, parseISO, startOfMonth, endOfMonth, isWithinInterval, subMonths, eachMonthOfInterval } from 'date-fns';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { GoogleGenAI } from "@google/genai";
+import { AIChat } from './components/AIChat';
 
 // --- Utility ---
 function cn(...inputs: ClassValue[]) {
@@ -67,6 +73,8 @@ interface AppSettings {
   userRole: string;
   userBio: string;
   userAvatar: string;
+  notificationSound: string;
+  notificationVolume: number;
 }
 
 type SyncStatus = 'synced' | 'syncing' | 'pending' | 'offline';
@@ -85,15 +93,24 @@ export default function App() {
 
   const [settings, setSettings] = useState<AppSettings>(() => {
     const saved = localStorage.getItem('appSettings');
-    return saved ? JSON.parse(saved) : { 
+    const defaultSettings: AppSettings = { 
       theme: 'dark', 
       target: 300, 
       shiftTime: '14:00',
       userName: 'Commander',
       userRole: 'Senior Rider',
       userBio: 'Navigating the neon streets of the future.',
-      userAvatar: 'commander-1'
+      userAvatar: 'commander-1',
+      notificationSound: 'https://cdn.pixabay.com/audio/2022/03/15/audio_78390a3607.mp3', // Futuristic beep
+      notificationVolume: 0.5
     };
+    
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Ensure all keys exist to prevent uncontrolled input warning
+      return { ...defaultSettings, ...parsed };
+    }
+    return defaultSettings;
   });
 
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
@@ -118,6 +135,15 @@ export default function App() {
     step: 0
   });
 
+  const [isShiftActive, setIsShiftActive] = useState(false);
+  const [showAiChat, setShowAiChat] = useState(false);
+  const [dynamicAiInsight, setDynamicAiInsight] = useState("সিস্টেম প্রস্তুত। আপনার প্রথম এন্ট্রিটি যোগ করুন।");
+  const [isInsightLoading, setIsInsightLoading] = useState(false);
+  const [isGoogleAuthenticated, setIsGoogleAuthenticated] = useState(false);
+  const [isBackingUp, setIsBackingUp] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+
   const [confirmModal, setConfirmModal] = useState<{
     show: boolean;
     title: string;
@@ -138,7 +164,16 @@ export default function App() {
   }, [logs]);
 
   useEffect(() => {
-    localStorage.setItem('appSettings', JSON.stringify(settings));
+    // Basic validation before saving
+    if (!settings.userName.trim()) {
+      setSettingsError("নাম খালি রাখা যাবে না।");
+    } else if (settings.target <= 0) {
+      setSettingsError("টার্গেট অবশ্যই ০-এর বেশি হতে হবে।");
+    } else {
+      setSettingsError(null);
+      localStorage.setItem('appSettings', JSON.stringify(settings));
+    }
+
     if (settings.theme === 'light') {
       document.documentElement.classList.add('light-mode');
     } else {
@@ -239,22 +274,103 @@ export default function App() {
     });
   }, [logs]);
 
-  // --- AI Insights ---
-  const aiInsight = useMemo(() => {
-    if (filteredLogs.length === 0) return "সিস্টেম প্রস্তুত। আপনার প্রথম এন্ট্রিটি যোগ করুন।";
-    
-    const avg = stats.totalDel / filteredLogs.length;
-    const daysInMonth = 30; // Simplified
-    const estimated = Math.round(avg * daysInMonth);
-    
-    let msg = `বর্তমান গতিতে মাস শেষে ডেলিভারি হতে পারে প্রায় ${estimated}টি। `;
-    if (estimated < settings.target) {
-      msg += "⚠️ টার্গেট ছুঁতে হলে গতি বাড়াতে হবে!";
-    } else {
-      msg += "✅ দারুণ! আপনি সঠিক পথেই আছেন।";
+  useEffect(() => {
+    const checkGoogleAuth = async () => {
+      try {
+        const res = await fetch('/api/auth/google/status');
+        const data = await res.json();
+        setIsGoogleAuthenticated(data.isAuthenticated);
+      } catch (err) {
+        console.error("Auth check error:", err);
+      }
+    };
+    checkGoogleAuth();
+
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'GOOGLE_AUTH_SUCCESS') {
+        setIsGoogleAuthenticated(true);
+        alert("গুগল ড্রাইভ সফলভাবে সংযুক্ত হয়েছে!");
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, []);
+
+  const connectGoogleDrive = async () => {
+    try {
+      const res = await fetch('/api/auth/google/url');
+      const { url } = await res.json();
+      window.open(url, 'google_auth', 'width=600,height=700');
+    } catch (err) {
+      console.error("Connect error:", err);
     }
-    return msg;
-  }, [stats.totalDel, filteredLogs.length, settings.target]);
+  };
+
+  const backupToGoogleDrive = async () => {
+    if (!isGoogleAuthenticated) {
+      connectGoogleDrive();
+      return;
+    }
+
+    setIsBackingUp(true);
+    try {
+      const res = await fetch('/api/backup/google-drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          data: { logs, settings },
+          fileName: `cyber_rider_backup_${settings.userName}.json`
+        })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        alert("ব্যাকআপ সফলভাবে গুগল ড্রাইভে সেভ হয়েছে!");
+      } else {
+        throw new Error(data.error);
+      }
+    } catch (err) {
+      console.error("Backup error:", err);
+      alert("ব্যাকআপ ব্যর্থ হয়েছে। আবার চেষ্টা করুন।");
+    } finally {
+      setIsBackingUp(false);
+    }
+  };
+  const fetchDynamicInsight = useCallback(async () => {
+    if (filteredLogs.length === 0 || isInsightLoading) return;
+    
+    setIsInsightLoading(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+      const prompt = `
+        Rider: ${settings.userName} (${settings.userRole})
+        Target: ${settings.target}
+        Current Month Stats: ${JSON.stringify(stats)}
+        Recent Logs: ${JSON.stringify(filteredLogs.slice(0, 5))}
+        
+        Provide a one-sentence, highly encouraging, futuristic AI insight in Bengali. 
+        Focus on their progress towards the target or their earnings. 
+        Keep it under 100 characters.
+      `;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: prompt,
+      });
+
+      if (response.text) {
+        setDynamicAiInsight(response.text.trim());
+      }
+    } catch (error) {
+      console.error("Insight Error:", error);
+    } finally {
+      setIsInsightLoading(false);
+    }
+  }, [filteredLogs, stats, settings.userName, settings.userRole, settings.target, isInsightLoading]);
+
+  useEffect(() => {
+    const timer = setTimeout(fetchDynamicInsight, 2000);
+    return () => clearTimeout(timer);
+  }, [filteredLogs.length]);
 
   // --- Notifications ---
   const requestNotificationPermission = async () => {
@@ -263,33 +379,58 @@ export default function App() {
     setNotificationPermission(permission);
   };
 
+  const playNotificationSound = useCallback(() => {
+    if (!settings.notificationSound) return;
+    const audio = new Audio(settings.notificationSound);
+    audio.volume = settings.notificationVolume;
+    audio.play().catch(err => console.error("Sound play error:", err));
+  }, [settings.notificationSound, settings.notificationVolume]);
+
   const sendNotification = useCallback((title: string, body: string) => {
+    playNotificationSound();
     if (notificationPermission === 'granted') {
       new Notification(title, {
         body,
         icon: 'https://picsum.photos/seed/rocket/128/128'
       });
     }
-  }, [notificationPermission]);
+  }, [notificationPermission, playNotificationSound]);
 
   // --- Shift Reminder Logic ---
   useEffect(() => {
     const checkTime = () => {
       const now = new Date();
       const currentTime = format(now, 'HH:mm');
-      if (currentTime === settings.shiftTime && !aiOverlay.show) {
-        sendNotification("Shift Reminder", "বস, অফিসের সময় হয়েছে! বের হবেন না?");
+      
+      // Trigger if current time is >= shift time AND shift hasn't been marked as started
+      if (currentTime >= settings.shiftTime && !isShiftActive && !aiOverlay.show) {
+        sendNotification("Shift Reminder 🚨", "বস, অফিসের সময় হয়ে গেছে! দ্রুত বের হন।");
         setAiOverlay({
           show: true,
-          message: "বস, অফিসের সময় হয়েছে! বের হবেন না?",
+          message: "আজকে কাজ কি করবেন?",
           step: 1
         });
       }
     };
 
+    // Check immediately on mount and then every minute
+    checkTime();
     const interval = setInterval(checkTime, 60000);
     return () => clearInterval(interval);
-  }, [settings.shiftTime, aiOverlay.show]);
+  }, [settings.shiftTime, aiOverlay.show, isShiftActive, sendNotification]);
+
+  // Reset shift status at midnight
+  useEffect(() => {
+    const now = new Date();
+    const night = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0);
+    const msToMidnight = night.getTime() - now.getTime();
+    
+    const timer = setTimeout(() => {
+      setIsShiftActive(false);
+    }, msToMidnight);
+    
+    return () => clearTimeout(timer);
+  }, [isShiftActive]);
 
   // --- Target Achievement Notification ---
   const hasNotifiedTarget = useRef(false);
@@ -304,14 +445,33 @@ export default function App() {
 
   // --- Handlers ---
   const handleSaveEntry = () => {
-    if (!formData.date) return;
+    setFormError(null);
+
+    if (!formData.date) {
+      setFormError("অনুগ্রহ করে তারিখ নির্বাচন করুন।");
+      return;
+    }
+
+    const count = parseInt(formData.count) || 0;
+    const advance = parseInt(formData.advance) || 0;
+    const extraLeave = parseInt(formData.extraLeave) || 0;
+
+    if (count === 0 && advance === 0 && extraLeave === 0) {
+      setFormError("ডেলিভারি, অগ্রিম বা ছুটির মধ্যে অন্তত একটি তথ্য দিন।");
+      return;
+    }
+
+    if (count < 0 || advance < 0 || extraLeave < 0) {
+      setFormError("নেগেটিভ ভ্যালু গ্রহণযোগ্য নয়।");
+      return;
+    }
 
     const newEntry: LogEntry = {
       id: editingId || crypto.randomUUID(),
       date: formData.date,
-      count: parseInt(formData.count) || 0,
-      advance: parseInt(formData.advance) || 0,
-      extraLeave: parseInt(formData.extraLeave) || 0
+      count,
+      advance,
+      extraLeave
     };
 
     if (editingId) {
@@ -383,24 +543,6 @@ export default function App() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-  };
-
-  const respondToAI = (going: boolean) => {
-    if (!going) {
-      const today = format(new Date(), 'yyyy-MM-dd');
-      const fineEntry: LogEntry = {
-        id: crypto.randomUUID(),
-        date: today,
-        count: 0,
-        advance: 0,
-        extraLeave: 1
-      };
-      setLogs(prev => [...prev, fineEntry]);
-      alert("বস, অলসতার জন্য ৩০০ টাকা জরিমানা এন্ট্রি করা হয়েছে।");
-    } else {
-      alert("চমৎকার! শুভ শিফট বস।");
-    }
-    setAiOverlay({ show: false, message: '', step: 0 });
   };
 
   // --- UI Components ---
@@ -494,11 +636,16 @@ export default function App() {
           </header>
 
           {/* AI Insight Card */}
-          <div className="ai-card-gradient border-neon-purple rounded-2xl p-4 mb-5 relative overflow-hidden">
-            <div className="absolute top-4 right-4 text-xl">🤖</div>
+          <div 
+            onClick={() => setShowAiChat(true)}
+            className="ai-card-gradient border-neon-purple rounded-2xl p-4 mb-5 relative overflow-hidden cursor-pointer hover:scale-[1.02] active:scale-95 transition-all"
+          >
+            <div className="absolute top-4 right-4 text-xl">
+              {isInsightLoading ? <Loader2 className="w-5 h-5 animate-spin text-neon-purple" /> : '🤖'}
+            </div>
             <span className="text-[10px] font-bold uppercase text-neon-purple mb-2 block tracking-widest">AI Smart Assistant</span>
             <p className="text-xs leading-relaxed text-[#d1d1d1]">
-              {aiInsight}
+              {dynamicAiInsight}
             </p>
           </div>
 
@@ -534,42 +681,66 @@ export default function App() {
 
           {/* Input Form */}
           <div className="grid grid-cols-2 gap-2 mb-5">
-            <div className="bg-white/5 border border-neon-blue/20 rounded-xl p-3">
+            <div className={cn(
+              "bg-white/5 border rounded-xl p-3 transition-colors",
+              formError && !formData.date ? "border-neon-red/50 bg-neon-red/5" : "border-neon-blue/20"
+            )}>
               <label className="text-[9px] font-bold uppercase text-text-dim block mb-1">Date</label>
               <input 
                 type="date" 
                 value={formData.date}
-                onChange={(e) => setFormData(f => ({ ...f, date: e.target.value }))}
+                onChange={(e) => {
+                  setFormError(null);
+                  setFormData(f => ({ ...f, date: e.target.value }));
+                }}
                 className="w-full bg-transparent text-xs outline-none"
               />
             </div>
-            <div className="bg-white/5 border border-neon-blue/20 rounded-xl p-3">
+            <div className={cn(
+              "bg-white/5 border rounded-xl p-3 transition-colors",
+              formError && (parseInt(formData.count) || 0) === 0 && (parseInt(formData.advance) || 0) === 0 && (parseInt(formData.extraLeave) || 0) === 0 ? "border-neon-red/50 bg-neon-red/5" : "border-neon-blue/20"
+            )}>
               <label className="text-[9px] font-bold uppercase text-text-dim block mb-1">Delivery</label>
               <input 
                 type="number" 
                 placeholder="0"
                 value={formData.count}
-                onChange={(e) => setFormData(f => ({ ...f, count: e.target.value }))}
+                onChange={(e) => {
+                  setFormError(null);
+                  setFormData(f => ({ ...f, count: e.target.value }));
+                }}
                 className="w-full bg-transparent text-xs outline-none"
               />
             </div>
-            <div className="bg-white/5 border border-neon-blue/20 rounded-xl p-3">
+            <div className={cn(
+              "bg-white/5 border rounded-xl p-3 transition-colors",
+              formError && (parseInt(formData.count) || 0) === 0 && (parseInt(formData.advance) || 0) === 0 && (parseInt(formData.extraLeave) || 0) === 0 ? "border-neon-red/50 bg-neon-red/5" : "border-neon-blue/20"
+            )}>
               <label className="text-[9px] font-bold uppercase text-text-dim block mb-1">Advance</label>
               <input 
                 type="number" 
                 placeholder="0"
                 value={formData.advance}
-                onChange={(e) => setFormData(f => ({ ...f, advance: e.target.value }))}
+                onChange={(e) => {
+                  setFormError(null);
+                  setFormData(f => ({ ...f, advance: e.target.value }));
+                }}
                 className="w-full bg-transparent text-xs outline-none"
               />
             </div>
-            <div className="bg-white/5 border border-neon-blue/20 rounded-xl p-3">
+            <div className={cn(
+              "bg-white/5 border rounded-xl p-3 transition-colors",
+              formError && (parseInt(formData.count) || 0) === 0 && (parseInt(formData.advance) || 0) === 0 && (parseInt(formData.extraLeave) || 0) === 0 ? "border-neon-red/50 bg-neon-red/5" : "border-neon-blue/20"
+            )}>
               <label className="text-[9px] font-bold uppercase text-text-dim block mb-1">Leave</label>
               <input 
                 type="number" 
                 placeholder="0"
                 value={formData.extraLeave}
-                onChange={(e) => setFormData(f => ({ ...f, extraLeave: e.target.value }))}
+                onChange={(e) => {
+                  setFormError(null);
+                  setFormData(f => ({ ...f, extraLeave: e.target.value }));
+                }}
                 className="w-full bg-transparent text-xs outline-none"
               />
             </div>
@@ -579,6 +750,15 @@ export default function App() {
             >
               {editingId ? 'Update Data' : 'Save Data'}
             </button>
+            {formError && (
+              <motion.p 
+                initial={{ opacity: 0, y: -10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="col-span-2 text-[10px] text-neon-red font-bold text-center mt-2"
+              >
+                ⚠️ {formError}
+              </motion.p>
+            )}
           </div>
 
           {/* Net Salary Display */}
@@ -649,10 +829,20 @@ export default function App() {
                   ))}
                   {filteredLogs.filter(l => l.count > 0).length === 0 && (
                     <tr>
-                      <td colSpan={3} className="py-8 text-center text-text-dim italic">No delivery logs.</td>
+                      <td colSpan={4} className="py-8 text-center text-text-dim italic">No delivery logs.</td>
                     </tr>
                   )}
                 </tbody>
+                {filteredLogs.filter(l => l.count > 0).length > 0 && (
+                  <tfoot className="border-t-2 border-neon-blue/20">
+                    <tr className="bg-neon-blue/5">
+                      <td className="py-3 px-2 font-bold uppercase text-neon-blue">Total</td>
+                      <td className="py-3 px-2 text-center font-bold text-neon-blue">{stats.totalDel}</td>
+                      <td className="py-3 px-2 text-center font-bold text-neon-blue">{stats.totalDel * DELIVERY_RATE}৳</td>
+                      <td className="py-3 px-2"></td>
+                    </tr>
+                  </tfoot>
+                )}
               </table>
             </div>
           </Card>
@@ -737,11 +927,27 @@ export default function App() {
         {/* Bottom Nav */}
         <div className="h-[70px] bg-[#0e111f]/90 backdrop-blur-md border-t border-white/5 flex justify-around items-center shrink-0">
           <button className="w-6 h-6 border-2 border-neon-blue rounded-md shadow-[0_0_10px_var(--color-neon-blue)]" />
-          <button className="w-6 h-6 border-2 border-text-dim/50 rounded-md opacity-50" />
+          <button 
+            onClick={() => setShowAiChat(true)}
+            className="w-10 h-10 bg-neon-purple rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(188,19,254,0.4)] hover:scale-110 active:scale-90 transition-all"
+          >
+            <Sparkles className="w-5 h-5 text-white" />
+          </button>
           <button className="w-6 h-6 border-2 border-text-dim/50 rounded-md opacity-50" />
           <button className="w-6 h-6 border-2 border-text-dim/50 rounded-md opacity-50" />
         </div>
       </div>
+
+      {/* AI Chat Interface */}
+      <AnimatePresence>
+        {showAiChat && (
+          <AIChat 
+            logs={logs} 
+            settings={settings} 
+            onClose={() => setShowAiChat(false)} 
+          />
+        )}
+      </AnimatePresence>
 
       {/* Sidebar (Full screen overlay for mockup) */}
       <AnimatePresence>
@@ -787,8 +993,14 @@ export default function App() {
                     <input 
                       type="text" 
                       value={settings.userName}
-                      onChange={(e) => setSettings(s => ({ ...s, userName: e.target.value }))}
-                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-neon-blue/50 transition-colors"
+                      onChange={(e) => {
+                        setSettingsError(null);
+                        setSettings(s => ({ ...s, userName: e.target.value }));
+                      }}
+                      className={cn(
+                        "w-full bg-white/5 border rounded-xl px-4 py-2.5 text-sm outline-none transition-colors",
+                        settingsError && !settings.userName.trim() ? "border-neon-red/50 focus:border-neon-red" : "border-white/10 focus:border-neon-blue/50"
+                      )}
                     />
                   </div>
                   <div>
@@ -817,8 +1029,16 @@ export default function App() {
                 <input 
                   type="number" 
                   value={settings.target}
-                  onChange={(e) => setSettings(s => ({ ...s, target: parseInt(e.target.value) || 0 }))}
-                  className="w-full bg-white/5 border border-neon-blue/30 rounded-xl px-4 py-3 outline-none focus:ring-2 ring-neon-blue/20"
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value);
+                    if (val < 0) return;
+                    setSettingsError(null);
+                    setSettings(s => ({ ...s, target: val || 0 }));
+                  }}
+                  className={cn(
+                    "w-full bg-white/5 border rounded-xl px-4 py-3 outline-none focus:ring-2 transition-all",
+                    settingsError && settings.target <= 0 ? "border-neon-red/50 focus:ring-neon-red/20" : "border-neon-blue/30 focus:ring-neon-blue/20"
+                  )}
                 />
               </div>
 
@@ -833,6 +1053,9 @@ export default function App() {
               </div>
 
               <div className="pt-4 space-y-3">
+                {settingsError && (
+                  <p className="text-[10px] text-neon-red font-bold text-center mb-2">⚠️ {settingsError}</p>
+                )}
                 <div className="glass border-white/5 p-4 rounded-2xl mb-2">
                   <div className="flex justify-between items-center mb-2">
                     <span className="text-[10px] font-bold uppercase text-text-dim">Cloud Sync</span>
@@ -884,6 +1107,81 @@ export default function App() {
                     {notificationPermission === 'granted' ? <Bell className="w-3 h-3" /> : <BellOff className="w-3 h-3" />}
                     {notificationPermission === 'granted' ? 'Alerts Active' : 'Enable Alerts'}
                   </button>
+                </div>
+
+                <div className="glass border-white/5 p-4 rounded-2xl mb-2">
+                  <div className="flex items-center gap-2 mb-4">
+                    <Volume2 className="w-4 h-4 text-neon-blue" />
+                    <span className="text-[10px] font-bold uppercase text-text-dim">Alert Sound & Volume</span>
+                  </div>
+                  
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-[10px] text-text-dim mb-2 block uppercase tracking-widest">Select Sound</label>
+                      <select 
+                        value={settings.notificationSound}
+                        onChange={(e) => setSettings(s => ({ ...s, notificationSound: e.target.value }))}
+                        className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs outline-none focus:border-neon-blue/50"
+                      >
+                        <option value="https://cdn.pixabay.com/audio/2022/03/15/audio_78390a3607.mp3">Futuristic Beep</option>
+                        <option value="https://cdn.pixabay.com/audio/2021/08/04/audio_0625c1539c.mp3">Cyber Alert</option>
+                        <option value="https://cdn.pixabay.com/audio/2022/03/10/audio_c8c8a73053.mp3">Digital Chime</option>
+                      </select>
+                    </div>
+                    
+                    <div>
+                      <div className="flex justify-between mb-2">
+                        <label className="text-[10px] text-text-dim uppercase tracking-widest">Volume</label>
+                        <span className="text-[10px] text-neon-blue font-bold">{Math.round(settings.notificationVolume * 100)}%</span>
+                      </div>
+                      <input 
+                        type="range" 
+                        min="0" 
+                        max="1" 
+                        step="0.1"
+                        value={settings.notificationVolume}
+                        onChange={(e) => setSettings(s => ({ ...s, notificationVolume: parseFloat(e.target.value) }))}
+                        className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-neon-blue"
+                      />
+                    </div>
+
+                    <button 
+                      onClick={playNotificationSound}
+                      className="w-full py-2 bg-neon-blue/10 border border-neon-blue/30 rounded-xl text-[10px] font-bold uppercase text-neon-blue hover:bg-neon-blue/20 transition-all"
+                    >
+                      Test Sound
+                    </button>
+                  </div>
+                </div>
+
+                <div className="glass border-white/5 p-4 rounded-2xl mb-2">
+                  <div className="flex items-center gap-2 mb-4">
+                    <HardDrive className="w-4 h-4 text-neon-green" />
+                    <span className="text-[10px] font-bold uppercase text-text-dim">Google Drive Backup</span>
+                  </div>
+                  
+                  <p className="text-[10px] text-text-dim mb-4">
+                    আপনার সকল ডেটা নিরাপদ রাখতে গুগল ড্রাইভে ব্যাকআপ রাখুন।
+                  </p>
+
+                  {!isGoogleAuthenticated ? (
+                    <button 
+                      onClick={connectGoogleDrive}
+                      className="w-full py-3 bg-white text-black font-bold rounded-xl text-xs uppercase hover:bg-white/90 transition-all flex items-center justify-center gap-2"
+                    >
+                      <img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" className="w-4 h-4" alt="Google" />
+                      Connect Google Drive
+                    </button>
+                  ) : (
+                    <button 
+                      disabled={isBackingUp}
+                      onClick={backupToGoogleDrive}
+                      className="w-full py-3 bg-neon-green/20 border border-neon-green/40 text-neon-green font-bold rounded-xl text-xs uppercase hover:bg-neon-green/30 transition-all flex items-center justify-center gap-2"
+                    >
+                      {isBackingUp ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Cloud className="w-4 h-4" />}
+                      {isBackingUp ? "Backing up..." : "Backup Now to Drive"}
+                    </button>
+                  )}
                 </div>
 
                 <button 
@@ -986,20 +1284,43 @@ export default function App() {
                 {aiOverlay.message}
               </p>
               
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-2 gap-4 mb-3">
                 <button 
-                  onClick={() => respondToAI(true)}
-                  className="bg-neon-green text-black font-bold py-3 rounded-xl hover:scale-105 transition-transform"
+                  onClick={() => {
+                    setIsShiftActive(true);
+                    setAiOverlay({ show: false, message: '', step: 0 });
+                  }}
+                  className="bg-neon-blue text-black font-bold py-4 rounded-2xl shadow-[0_0_20px_rgba(0,243,255,0.3)] hover:scale-105 transition-all flex items-center justify-center gap-2"
                 >
-                  হ্যাঁ, যাচ্ছি
+                  <CheckCircle2 className="w-5 h-5" />
+                  হ্যাঁ
                 </button>
                 <button 
-                  onClick={() => respondToAI(false)}
-                  className="bg-neon-red text-white font-bold py-3 rounded-xl hover:scale-105 transition-transform"
+                  onClick={() => {
+                    const today = format(new Date(), 'yyyy-MM-dd');
+                    const fineEntry: LogEntry = {
+                      id: crypto.randomUUID(),
+                      date: today,
+                      count: 0,
+                      advance: 0,
+                      extraLeave: 1
+                    };
+                    setLogs(prev => [...prev, fineEntry]);
+                    setIsShiftActive(true);
+                    setAiOverlay({ show: false, message: '', step: 0 });
+                  }}
+                  className="bg-neon-red text-white font-bold py-4 rounded-2xl shadow-[0_0_20px_rgba(255,0,60,0.2)] hover:scale-105 transition-all flex items-center justify-center gap-2"
                 >
-                  না, পারবো না
+                  <X className="w-5 h-5" />
+                  না
                 </button>
               </div>
+              <button 
+                onClick={() => setAiOverlay({ show: false, message: '', step: 0 })}
+                className="w-full bg-white/5 border border-white/10 text-white font-bold py-4 rounded-2xl hover:bg-white/10 transition-all"
+              >
+                পরে মনে করান
+              </button>
             </motion.div>
           </motion.div>
         )}
