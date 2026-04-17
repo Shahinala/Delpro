@@ -18,16 +18,21 @@ export default defineConfig(({mode}) => {
           short_name: 'CyberRider',
           description: 'AI-Powered Delivery & Salary Tracker',
           theme_color: '#0a0a0a',
+          background_color: '#0a0a0a',
+          display: 'standalone',
+          orientation: 'portrait',
           icons: [
             {
               src: 'https://api.dicebear.com/7.x/bottts/svg?seed=commander-1',
               sizes: '192x192',
-              type: 'image/svg+xml'
+              type: 'image/svg+xml',
+              purpose: 'any maskable'
             },
             {
               src: 'https://api.dicebear.com/7.x/bottts/svg?seed=commander-1',
               sizes: '512x512',
-              type: 'image/svg+xml'
+              type: 'image/svg+xml',
+              purpose: 'any maskable'
             }
           ]
         }

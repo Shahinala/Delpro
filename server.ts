@@ -11,6 +11,9 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
+// Essential for AI Studio / Proxied environments
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(express.json());
 app.use(cookieParser());
@@ -21,7 +24,8 @@ app.use(session({
   cookie: { 
     secure: true, 
     sameSite: 'none',
-    httpOnly: true 
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
   }
 }));
 
@@ -42,9 +46,9 @@ const getRedirectUri = (req?: express.Request) => {
 };
 
 // Lazy initialize oauth2Client
-const getOAuth2Client = (req: express.Request, manualClient?: { id: string; secret: string }) => {
-  const clientId = (manualClient?.id || process.env.GOOGLE_CLIENT_ID || "").trim();
-  const clientSecret = (manualClient?.secret || process.env.GOOGLE_CLIENT_SECRET || "").trim();
+const getOAuth2Client = (req: express.Request) => {
+  const clientId = (process.env.GOOGLE_CLIENT_ID || "").trim();
+  const clientSecret = (process.env.GOOGLE_CLIENT_SECRET || "").trim();
   
   return new google.auth.OAuth2(
     clientId,
@@ -60,28 +64,19 @@ app.get("/api/health", (req, res) => {
 
 // 1. Get Google Auth URL
 app.get("/api/auth/google/url", (req, res) => {
-  const manualId = req.query.cid as string;
-  const manualSecret = req.query.cs as string;
-
-  const clientId = manualId || process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = manualSecret || process.env.GOOGLE_CLIENT_SECRET;
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
 
   if (!clientId || !clientSecret) {
     return res.status(400).json({ 
       error: "CREDENTIALS_MISSING",
       redirectUri: getRedirectUri(req),
-      message: "Credentials missing"
+      message: "Google API Credentials are not configured in AI Studio Secrets."
     });
   }
 
   try {
-    const oauth2Client = getOAuth2Client(req, manualId ? { id: manualId, secret: manualSecret } : undefined);
-    
-    // Always pack the credentials used into the state to ensure consistency on callback
-    const usedClientId = (oauth2Client as any)._clientId;
-    const usedClientSecret = (oauth2Client as any)._clientSecret;
-    const state = Buffer.from(JSON.stringify({ cid: usedClientId, cs: usedClientSecret })).toString('base64');
-
+    const oauth2Client = getOAuth2Client(req);
     const scopes = [
       'https://www.googleapis.com/auth/drive.file',
       'https://www.googleapis.com/auth/userinfo.profile'
@@ -90,8 +85,7 @@ app.get("/api/auth/google/url", (req, res) => {
     const url = oauth2Client.generateAuthUrl({
       access_type: 'offline',
       scope: scopes,
-      prompt: 'consent',
-      state: state
+      prompt: 'consent'
     });
 
     res.json({ url, redirectUri: getRedirectUri(req) });
@@ -102,33 +96,12 @@ app.get("/api/auth/google/url", (req, res) => {
 
 // 2. Google OAuth Callback
 app.get("/auth/google/callback", async (req, res) => {
-  const { code, state } = req.query;
+  const { code } = req.query;
   try {
-    let manualClient;
-    if (state && state !== 'default') {
-      try {
-        const decoded = JSON.parse(Buffer.from(state as string, 'base64').toString());
-        if (decoded.cid && decoded.cs) {
-          manualClient = { id: decoded.cid, secret: decoded.cs };
-        }
-      } catch (e) {
-        console.error("State decode error:", e);
-      }
-    }
-
-    const oauth2Client = getOAuth2Client(req, manualClient);
-    
-    const clientKeys = (oauth2Client as any)._clientId && (oauth2Client as any)._clientSecret;
-    if (!clientKeys) {
-       throw new Error("Client ID বা Secret খুঁজে পাওয়া যায়নি। অনুগ্রহ করে 'Manual API Setup'-এ গিয়ে আইডি এবং সিক্রেট দুটিই পুনরায় দিন।");
-    }
-
+    const oauth2Client = getOAuth2Client(req);
     const { tokens } = await oauth2Client.getToken(code as string);
-    // Store tokens and manual client in session
+    // Store tokens in session
     (req as any).session.tokens = tokens;
-    if (manualClient) {
-      (req as any).session.manualClient = manualClient;
-    }
     
     res.send(`
       <html>
@@ -176,10 +149,7 @@ app.get("/api/auth/google/status", (req, res) => {
 
 // 4. Backup to Google Drive
 app.post("/api/backup/google-drive", async (req, res) => {
-  const sessionData = (req as any).session;
-  const tokens = sessionData.tokens;
-  const manualClient = sessionData.manualClient;
-
+  const tokens = (req as any).session.tokens;
   if (!tokens) {
     return res.status(401).json({ error: "Not authenticated with Google" });
   }
@@ -187,7 +157,7 @@ app.post("/api/backup/google-drive", async (req, res) => {
   const { data, fileName } = req.body;
   
   try {
-    const oauth2Client = getOAuth2Client(req, manualClient);
+    const oauth2Client = getOAuth2Client(req);
     oauth2Client.setCredentials(tokens);
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
@@ -235,10 +205,7 @@ app.post("/api/backup/google-drive", async (req, res) => {
 
 // 5. Restore from Google Drive
 app.get("/api/backup/google-drive/restore", async (req, res) => {
-  const sessionData = (req as any).session;
-  const tokens = sessionData.tokens;
-  const manualClient = sessionData.manualClient;
-
+  const tokens = (req as any).session.tokens;
   if (!tokens) {
     return res.status(401).json({ error: "Not authenticated with Google" });
   }
@@ -246,7 +213,7 @@ app.get("/api/backup/google-drive/restore", async (req, res) => {
   const { fileName } = req.query;
   
   try {
-    const oauth2Client = getOAuth2Client(req, manualClient);
+    const oauth2Client = getOAuth2Client(req);
     oauth2Client.setCredentials(tokens);
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 

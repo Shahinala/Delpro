@@ -18,7 +18,8 @@
 
 @layer base {
   body {
-    @apply bg-[#020205] text-white font-sans antialiased;
+    @apply bg-[#020205] text-white font-sans antialiased min-h-screen overflow-hidden;
+    overscroll-behavior: none;
   }
 }
 
