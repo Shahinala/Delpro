@@ -1,0 +1,54 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Stores user-specific settings and profile data.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "email": { "type": "string", "format": "email" },
+        "userName": { "type": "string" },
+        "userRole": { "type": "string" },
+        "userBio": { "type": "string" },
+        "userAvatar": { "type": "string" },
+        "target": { "type": "number" },
+        "shiftTime": { "type": "string" },
+        "baseSalary": { "type": "number" },
+        "deliveryRate": { "type": "number" },
+        "theme": { "type": "string", "enum": ["dark", "light"] },
+        "notificationVolume": { "type": "number" },
+        "notificationSound": { "type": "string" },
+        "holidays": { "type": "array", "description": "List of holiday dates (YYYY-MM-DD)" },
+        "autoBackup": { "type": "string", "enum": ["daily", "weekly", "never"] },
+        "lastBackupDate": { "type": "string", "format": "date-time" },
+        "lastBackupSize": { "type": "string" }
+      },
+      "required": ["uid", "email", "userName"]
+    },
+    "LogEntry": {
+      "title": "Delivery Log Entry",
+      "description": "A single day's delivery and financial log.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "uid": { "type": "string", "description": "Owner UID" },
+        "date": { "type": "string", "format": "date" },
+        "count": { "type": "number" },
+        "advance": { "type": "number" },
+        "extraLeave": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "date", "count"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile and settings"
+    },
+    "/logs/{logId}": {
+      "schema": "LogEntry",
+      "description": "Individual delivery log entries"
+    }
+  }
+}

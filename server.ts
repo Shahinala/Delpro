@@ -25,11 +25,33 @@ app.use(session({
   }
 }));
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  `${process.env.APP_URL}/auth/google/callback`
-);
+const getRedirectUri = (req?: express.Request) => {
+  let appUrl = process.env.APP_URL;
+  
+  if (!appUrl && req) {
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.headers.host;
+    appUrl = `${protocol}://${host}`;
+  }
+  
+  if (!appUrl) return "";
+  
+  // Ensure no trailing slash
+  const cleanUrl = appUrl.endsWith("/") ? appUrl.slice(0, -1) : appUrl;
+  return `${cleanUrl}/auth/google/callback`;
+};
+
+// Lazy initialize oauth2Client
+const getOAuth2Client = (req: express.Request, manualClient?: { id: string; secret: string }) => {
+  const clientId = (manualClient?.id || process.env.GOOGLE_CLIENT_ID || "").trim();
+  const clientSecret = (manualClient?.secret || process.env.GOOGLE_CLIENT_SECRET || "").trim();
+  
+  return new google.auth.OAuth2(
+    clientId,
+    clientSecret,
+    getRedirectUri(req)
+  );
+};
 
 // API Routes
 app.get("/api/health", (req, res) => {
@@ -38,46 +60,111 @@ app.get("/api/health", (req, res) => {
 
 // 1. Get Google Auth URL
 app.get("/api/auth/google/url", (req, res) => {
-  const scopes = [
-    'https://www.googleapis.com/auth/drive.file',
-    'https://www.googleapis.com/auth/userinfo.profile'
-  ];
+  const manualId = req.query.cid as string;
+  const manualSecret = req.query.cs as string;
 
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: scopes,
-    prompt: 'consent'
-  });
+  const clientId = manualId || process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = manualSecret || process.env.GOOGLE_CLIENT_SECRET;
 
-  res.json({ url });
+  if (!clientId || !clientSecret) {
+    return res.status(400).json({ 
+      error: "CREDENTIALS_MISSING",
+      redirectUri: getRedirectUri(req),
+      message: "Credentials missing"
+    });
+  }
+
+  try {
+    const oauth2Client = getOAuth2Client(req, manualId ? { id: manualId, secret: manualSecret } : undefined);
+    
+    // Always pack the credentials used into the state to ensure consistency on callback
+    const usedClientId = (oauth2Client as any)._clientId;
+    const usedClientSecret = (oauth2Client as any)._clientSecret;
+    const state = Buffer.from(JSON.stringify({ cid: usedClientId, cs: usedClientSecret })).toString('base64');
+
+    const scopes = [
+      'https://www.googleapis.com/auth/drive.file',
+      'https://www.googleapis.com/auth/userinfo.profile'
+    ];
+
+    const url = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: scopes,
+      prompt: 'consent',
+      state: state
+    });
+
+    res.json({ url, redirectUri: getRedirectUri(req) });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 2. Google OAuth Callback
 app.get("/auth/google/callback", async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
   try {
+    let manualClient;
+    if (state && state !== 'default') {
+      try {
+        const decoded = JSON.parse(Buffer.from(state as string, 'base64').toString());
+        if (decoded.cid && decoded.cs) {
+          manualClient = { id: decoded.cid, secret: decoded.cs };
+        }
+      } catch (e) {
+        console.error("State decode error:", e);
+      }
+    }
+
+    const oauth2Client = getOAuth2Client(req, manualClient);
+    
+    const clientKeys = (oauth2Client as any)._clientId && (oauth2Client as any)._clientSecret;
+    if (!clientKeys) {
+       throw new Error("Client ID বা Secret খুঁজে পাওয়া যায়নি। অনুগ্রহ করে 'Manual API Setup'-এ গিয়ে আইডি এবং সিক্রেট দুটিই পুনরায় দিন।");
+    }
+
     const { tokens } = await oauth2Client.getToken(code as string);
-    // Store tokens in session
+    // Store tokens and manual client in session
     (req as any).session.tokens = tokens;
+    if (manualClient) {
+      (req as any).session.manualClient = manualClient;
+    }
     
     res.send(`
       <html>
-        <body>
-          <script>
-            if (window.opener) {
-              window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS' }, '*');
-              window.close();
-            } else {
-              window.location.href = '/';
-            }
-          </script>
-          <p>Authentication successful. This window should close automatically.</p>
+        <body style="background: #0a0a0a; color: white; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
+          <div style="text-align: center; border: 1px solid #333; padding: 40px; border-radius: 20px; background: #111;">
+            <div style="font-size: 48px; margin-bottom: 20px;">✅</div>
+            <h2 style="margin-bottom: 10px; color: #00f3ff;">Authentication Successful!</h2>
+            <p style="color: #888; font-size: 14px;">গুগল ড্রাইভ সফলভাবে সংযুক্ত হয়েছে। এই উইন্ডোটি অটোমেটিক বন্ধ হয়ে যাবে।</p>
+            <script>
+              if (window.opener) {
+                window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS' }, '*');
+                setTimeout(() => window.close(), 1500);
+              }
+            </script>
+          </div>
         </body>
       </html>
     `);
-  } catch (error) {
+  } catch (error: any) {
     console.error("OAuth Error:", error);
-    res.status(500).send("Authentication failed");
+    res.status(500).send(`
+      <html>
+        <body style="background: #0a0a0a; color: white; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; padding: 20px;">
+          <div style="text-align: center; border: 1px solid #ff0055; padding: 40px; border-radius: 20px; background: #111; max-width: 500px;">
+            <div style="font-size: 48px; margin-bottom: 20px;">❌</div>
+            <h2 style="margin-bottom: 10px; color: #ff0055;">Authentication Failed</h2>
+            <p style="color: #ccc; font-size: 14px; line-height: 1.6;">
+              ${error.message || "Unknown error during authentication."}
+              <br/><br/>
+              <span style="color: #888;">টিপস: আপনি কি Client Secret দিতে ভুলে গেছেন? আপনার গুগল ক্লাউড কনসোল থেকে Secret আইডিটি কপি করে 'Manual API Setup'-এ দিন।</span>
+            </p>
+            <button onclick="window.close()" style="margin-top: 30px; background: #333; color: white; border: none; padding: 10px 20px; border-radius: 10px; cursor: pointer;">Close Window</button>
+          </div>
+        </body>
+      </html>
+    `);
   }
 });
 
@@ -89,7 +176,10 @@ app.get("/api/auth/google/status", (req, res) => {
 
 // 4. Backup to Google Drive
 app.post("/api/backup/google-drive", async (req, res) => {
-  const tokens = (req as any).session.tokens;
+  const sessionData = (req as any).session;
+  const tokens = sessionData.tokens;
+  const manualClient = sessionData.manualClient;
+
   if (!tokens) {
     return res.status(401).json({ error: "Not authenticated with Google" });
   }
@@ -97,6 +187,7 @@ app.post("/api/backup/google-drive", async (req, res) => {
   const { data, fileName } = req.body;
   
   try {
+    const oauth2Client = getOAuth2Client(req, manualClient);
     oauth2Client.setCredentials(tokens);
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
@@ -139,6 +230,55 @@ app.post("/api/backup/google-drive", async (req, res) => {
   } catch (error) {
     console.error("Drive Backup Error:", error);
     res.status(500).json({ error: "Failed to backup to Google Drive" });
+  }
+});
+
+// 5. Restore from Google Drive
+app.get("/api/backup/google-drive/restore", async (req, res) => {
+  const sessionData = (req as any).session;
+  const tokens = sessionData.tokens;
+  const manualClient = sessionData.manualClient;
+
+  if (!tokens) {
+    return res.status(401).json({ error: "Not authenticated with Google" });
+  }
+
+  const { fileName } = req.query;
+  
+  try {
+    const oauth2Client = getOAuth2Client(req, manualClient);
+    oauth2Client.setCredentials(tokens);
+    const drive = google.drive({ version: 'v3', auth: oauth2Client });
+
+    // Search for backup file
+    const response = await drive.files.list({
+      q: `name = '${fileName}' and trashed = false`,
+      fields: 'files(id, name, size, modifiedTime)',
+      spaces: 'drive',
+    });
+
+    const existingFile = response.data.files?.[0];
+
+    if (!existingFile) {
+      return res.status(404).json({ error: "Backup file not found" });
+    }
+
+    // Download file content
+    const fileContent = await drive.files.get({
+      fileId: existingFile.id!,
+      alt: 'media',
+    });
+
+    res.json({ 
+      data: fileContent.data,
+      info: {
+        size: existingFile.size,
+        modifiedTime: existingFile.modifiedTime
+      }
+    });
+  } catch (error) {
+    console.error("Drive Restore Error:", error);
+    res.status(500).json({ error: "Failed to restore from Google Drive" });
   }
 });
 

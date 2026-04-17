@@ -32,7 +32,9 @@ import {
   Loader2,
   Sparkles,
   Volume2,
-  HardDrive
+  HardDrive,
+  Zap,
+  LogOut
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -45,11 +47,31 @@ import {
   ResponsiveContainer,
   Cell
 } from 'recharts';
-import { format, parseISO, startOfMonth, endOfMonth, isWithinInterval, subMonths, eachMonthOfInterval } from 'date-fns';
+import { format, parseISO, startOfMonth, endOfMonth, isWithinInterval, subMonths, eachMonthOfInterval, eachDayOfInterval } from 'date-fns';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { GoogleGenAI } from "@google/genai";
 import { AIChat } from './components/AIChat';
+
+import { 
+  auth, 
+  db, 
+  googleProvider, 
+  signInWithPopup, 
+  signOut, 
+  onAuthStateChanged, 
+  type User,
+  collection,
+  query,
+  where,
+  onSnapshot,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  doc,
+  setDoc,
+  getDoc
+} from './firebase';
 
 // --- Utility ---
 function cn(...inputs: ClassValue[]) {
@@ -59,6 +81,7 @@ function cn(...inputs: ClassValue[]) {
 // --- Types ---
 interface LogEntry {
   id: string;
+  uid?: string;
   date: string;
   count: number;
   advance: number;
@@ -75,14 +98,15 @@ interface AppSettings {
   userAvatar: string;
   notificationSound: string;
   notificationVolume: number;
+  baseSalary: number;
+  deliveryRate: number;
+  holidays: string[];
+  autoBackup: 'daily' | 'weekly' | 'never';
+  lastBackupDate: string | null;
+  lastBackupSize: string | null;
 }
 
 type SyncStatus = 'synced' | 'syncing' | 'pending' | 'offline';
-
-// --- Constants ---
-const BASE_SALARY = 9000;
-const DELIVERY_RATE = 20;
-const LEAVE_FINE_RATE = 300;
 
 export default function App() {
   // --- State ---
@@ -101,8 +125,14 @@ export default function App() {
       userRole: 'Senior Rider',
       userBio: 'Navigating the neon streets of the future.',
       userAvatar: 'commander-1',
-      notificationSound: 'https://cdn.pixabay.com/audio/2022/03/15/audio_78390a3607.mp3', // Futuristic beep
-      notificationVolume: 0.5
+      notificationSound: 'https://assets.mixkit.co/active_storage/sfx/2568/2568-preview.mp3', // Futuristic beep
+      notificationVolume: 0.5,
+      baseSalary: 9000,
+      deliveryRate: 20,
+      holidays: [],
+      autoBackup: 'never',
+      lastBackupDate: null,
+      lastBackupSize: null
     };
     
     if (saved) {
@@ -143,13 +173,21 @@ export default function App() {
   const [isBackingUp, setIsBackingUp] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [isSystemInitialized, setIsSystemInitialized] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [showManualDriveSetup, setShowManualDriveSetup] = useState(false);
+  const [manualDriveKeys, setManualDriveKeys] = useState(() => {
+    const saved = localStorage.getItem('manualDriveKeys');
+    return saved ? JSON.parse(saved) : { clientId: '', clientSecret: '' };
+  });
 
   const [confirmModal, setConfirmModal] = useState<{
     show: boolean;
     title: string;
     message: string;
     onConfirm: () => void;
-    type: 'delete' | 'edit' | 'info';
+    type: 'delete' | 'edit' | 'info' | 'setup';
   }>({
     show: false,
     title: '',
@@ -169,9 +207,15 @@ export default function App() {
       setSettingsError("নাম খালি রাখা যাবে না।");
     } else if (settings.target <= 0) {
       setSettingsError("টার্গেট অবশ্যই ০-এর বেশি হতে হবে।");
+    } else if (settings.baseSalary < 0 || settings.deliveryRate < 0) {
+      setSettingsError("স্যালারি ভ্যালু নেগেটিভ হতে পারবে না।");
     } else {
       setSettingsError(null);
       localStorage.setItem('appSettings', JSON.stringify(settings));
+      if (user) {
+        setDoc(doc(db, 'users', user.uid), { ...settings, uid: user.uid, email: user.email }, { merge: true })
+          .catch(err => console.error("Settings Sync Error:", err));
+      }
     }
 
     if (settings.theme === 'light') {
@@ -179,7 +223,106 @@ export default function App() {
     } else {
       document.documentElement.classList.remove('light-mode');
     }
+
+    // Migration for broken sound URLs
+    const brokenUrls = [
+      'https://cdn.pixabay.com/audio/2022/03/15/audio_78390a3607.mp3',
+      'https://cdn.pixabay.com/audio/2021/08/04/audio_0625c1539c.mp3',
+      'https://cdn.pixabay.com/audio/2022/03/10/audio_c8c8a73053.mp3'
+    ];
+    if (brokenUrls.includes(settings.notificationSound)) {
+      setSettings(s => ({ ...s, notificationSound: 'https://assets.mixkit.co/active_storage/sfx/2568/2568-preview.mp3' }));
+    }
   }, [settings]);
+
+  // --- Firebase Auth & Data Sync ---
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      setIsAuthLoading(false);
+
+      if (currentUser) {
+        // Load settings from Firestore
+        const userDoc = await getDoc(doc(db, 'users', currentUser.uid));
+        if (userDoc.exists()) {
+          setSettings(s => ({ ...s, ...userDoc.data() }));
+        } else {
+          // Initialize user doc if it doesn't exist
+          const initialSettings = {
+            uid: currentUser.uid,
+            email: currentUser.email,
+            userName: currentUser.displayName || 'Rider',
+            userRole: 'Rider',
+            userBio: 'Cyber Rider Pro User',
+            userAvatar: `bot-${currentUser.uid.slice(0, 5)}`,
+            target: 300,
+            shiftTime: '14:00',
+            baseSalary: 9000,
+            deliveryRate: 20,
+            theme: 'dark',
+            notificationVolume: 0.5,
+            notificationSound: 'https://assets.mixkit.co/active_storage/sfx/2568/2568-preview.mp3',
+            holidays: [],
+            autoBackup: 'never',
+            lastBackupDate: null,
+            lastBackupSize: null
+          };
+          await setDoc(doc(db, 'users', currentUser.uid), initialSettings);
+          setSettings(s => ({ ...s, ...initialSettings }));
+        }
+
+        // Real-time logs sync
+        const q = query(collection(db, 'logs'), where('uid', '==', currentUser.uid));
+        const unsubscribeLogs = onSnapshot(q, (snapshot) => {
+          const fetchedLogs = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+          })) as LogEntry[];
+          setLogs(fetchedLogs);
+          localStorage.setItem('deliveryLogs', JSON.stringify(fetchedLogs));
+        }, (error) => {
+          console.error("Firestore Logs Error:", error);
+        });
+
+        return () => unsubscribeLogs();
+      } else {
+        setLogs([]);
+        localStorage.removeItem('deliveryLogs');
+      }
+    });
+
+    return () => unsubscribeAuth();
+  }, []);
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      console.error("Login Error:", error);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (error) {
+      console.error("Logout Error:", error);
+    }
+  };
+
+  const handleSidebarLogout = () => {
+    setConfirmModal({
+      show: true,
+      title: 'Logout? 🚪',
+      message: 'আপনি কি নিশ্চিত যে লগআউট করতে চান?',
+      onConfirm: () => {
+        handleLogout();
+        setConfirmModal(prev => ({ ...prev, show: false }));
+        setIsSidebarOpen(false);
+      },
+      type: 'info'
+    });
+  };
 
   // --- Network Listeners ---
   useEffect(() => {
@@ -201,20 +344,38 @@ export default function App() {
     };
   }, []);
 
-  // --- Sync Logic (Simulated) ---
+  // --- Sync Logic ---
   const syncWithCloud = useCallback(async () => {
     if (!isOnline || syncStatus === 'syncing') return;
 
     setSyncStatus('syncing');
     
-    // Simulate API latency for data synchronization
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    const now = new Date().toISOString();
-    setLastSynced(now);
-    localStorage.setItem('lastSynced', now);
-    setSyncStatus('synced');
-  }, [isOnline, syncStatus]);
+    try {
+      if (isGoogleAuthenticated) {
+        // Real sync with Google Drive
+        const res = await fetch('/api/backup/google-drive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            data: { logs, settings },
+            fileName: `cyber_rider_backup_${settings.userName}.json`
+          })
+        });
+        if (!res.ok) throw new Error("Drive sync failed");
+      } else {
+        // Simulated sync if Google is not connected
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+      
+      const now = new Date().toISOString();
+      setLastSynced(now);
+      localStorage.setItem('lastSynced', now);
+      setSyncStatus('synced');
+    } catch (err) {
+      console.error("Sync error:", err);
+      setSyncStatus('offline');
+    }
+  }, [isOnline, syncStatus, isGoogleAuthenticated, logs, settings]);
 
   // Auto-sync when coming back online or when data changes
   useEffect(() => {
@@ -236,6 +397,10 @@ export default function App() {
     }
   }, [logs, isOnline]);
 
+  useEffect(() => {
+    localStorage.setItem('manualDriveKeys', JSON.stringify(manualDriveKeys));
+  }, [manualDriveKeys]);
+
   // --- Calculations ---
   const filteredLogs = useMemo(() => {
     return logs.filter(log => log.date.startsWith(selectedMonth));
@@ -250,11 +415,11 @@ export default function App() {
     if (totalDel >= 350) bonus = 2000;
     else if (totalDel >= 300) bonus = 1000;
 
-    const fine = totalLeave * LEAVE_FINE_RATE;
-    const netSalary = (BASE_SALARY + (totalDel * DELIVERY_RATE) + bonus) - totalAdv - fine;
+    const fine = Math.round((settings.baseSalary / 30) * totalLeave);
+    const netSalary = (settings.baseSalary + (totalDel * settings.deliveryRate) + bonus) - totalAdv - fine;
 
     return { totalDel, totalAdv, totalLeave, bonus, fine, netSalary };
-  }, [filteredLogs]);
+  }, [filteredLogs, settings]);
 
   const chartData = useMemo(() => {
     const months = eachMonthOfInterval({
@@ -298,17 +463,43 @@ export default function App() {
 
   const connectGoogleDrive = async () => {
     try {
-      const res = await fetch('/api/auth/google/url');
-      const { url } = await res.json();
-      window.open(url, 'google_auth', 'width=600,height=700');
+      const queryParams = new URLSearchParams();
+      if (manualDriveKeys.clientId) queryParams.append('cid', manualDriveKeys.clientId);
+      if (manualDriveKeys.clientSecret) queryParams.append('cs', manualDriveKeys.clientSecret);
+      
+      const res = await fetch(`/api/auth/google/url?${queryParams.toString()}`);
+      const data = await res.json();
+
+      if (!res.ok && data.error === 'CREDENTIALS_MISSING') {
+        setShowManualDriveSetup(true);
+        return;
+      }
+
+      const { url } = data;
+      
+      const width = 600;
+      const height = 700;
+      const left = window.screenX + (window.outerWidth - width) / 2;
+      const top = window.screenY + (window.outerHeight - height) / 2;
+      
+      const authWindow = window.open(
+        url, 
+        'google_auth', 
+        `width=${width},height=${height},left=${left},top=${top},status=no,menubar=no,toolbar=no`
+      );
+
+      if (!authWindow || authWindow.closed || typeof authWindow.closed === 'undefined') {
+        alert("পপ-আপ ব্লক করা হয়েছে! অনুগ্রহ করে ব্রাউজারের পপ-আপ সেটিংস চেক করুন।");
+      }
     } catch (err) {
       console.error("Connect error:", err);
+      alert("গুগল ড্রাইভের সাথে সংযোগ করতে সমস্যা হচ্ছে। আবার চেষ্টা করুন।");
     }
   };
 
-  const backupToGoogleDrive = async () => {
+  const backupToGoogleDrive = async (isAuto = false) => {
     if (!isGoogleAuthenticated) {
-      connectGoogleDrive();
+      if (!isAuto) connectGoogleDrive();
       return;
     }
 
@@ -319,22 +510,140 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           data: { logs, settings },
-          fileName: `cyber_rider_backup_${settings.userName}.json`
+          fileName: `cyber_rider_backup_${user?.uid || 'user'}.json`
         })
       });
       const data = await res.json();
       if (res.ok) {
-        alert("ব্যাকআপ সফলভাবে গুগল ড্রাইভে সেভ হয়েছে!");
+        const now = new Date().toISOString();
+        const size = `${(JSON.stringify({ logs, settings }).length / 1024).toFixed(1)} KB`;
+        
+        setSettings(s => ({
+          ...s,
+          lastBackupDate: now,
+          lastBackupSize: size
+        }));
+        
+        if (!isAuto) {
+          setConfirmModal({
+            show: true,
+            title: 'Backup Successful! ☁️',
+            message: 'আপনার সকল ডেটা গুগল ড্রাইভে ব্যাকআপ করা হয়েছে।',
+            onConfirm: () => setConfirmModal(prev => ({ ...prev, show: false })),
+            type: 'info'
+          });
+        }
       } else {
         throw new Error(data.error);
       }
     } catch (err) {
       console.error("Backup error:", err);
-      alert("ব্যাকআপ ব্যর্থ হয়েছে। আবার চেষ্টা করুন।");
+      if (!isAuto) alert("ব্যাকআপ করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।");
     } finally {
       setIsBackingUp(false);
     }
   };
+
+  const restoreFromGoogleDrive = async () => {
+    if (!isGoogleAuthenticated) {
+      connectGoogleDrive();
+      return;
+    }
+
+    setAiOverlay({ show: true, message: 'রিপোরিং ডেটা ফ্রম ক্লাউড...', step: 0 });
+    try {
+      const res = await fetch(`/api/backup/google-drive/restore?fileName=cyber_rider_backup_${user?.uid || 'user'}.json`);
+      const data = await res.json();
+      
+      if (res.ok) {
+        const { logs: restoredLogs, settings: restoredSettings } = data.data;
+        
+        setConfirmModal({
+          show: true,
+          title: 'Restore Backup? 💾',
+          message: `একটি ব্যাকআপ পাওয়া গেছে (${data.info.size} bytes, ${format(parseISO(data.info.modifiedTime), 'PPp')})। আপনি কি এটি লোকাল ডেটা দিয়ে রিপ্লেস করতে চান?`,
+          onConfirm: () => {
+            setLogs(restoredLogs);
+            setSettings(s => ({ ...s, ...restoredSettings }));
+            setConfirmModal(prev => ({ ...prev, show: false }));
+            setAiOverlay({ show: true, message: 'ডেটা রিস্টোর সম্পন্ন হয়েছে! রিফ্রেশ হচ্ছে...', step: 100 });
+            setTimeout(() => setAiOverlay({ show: false, message: '', step: 0 }), 2000);
+          },
+          type: 'info'
+        });
+      } else {
+        alert("কোনো ব্যাকআপ ফাইল খুঁজে পাওয়া যায়নি।");
+      }
+    } catch (err) {
+      console.error("Restore error:", err);
+      alert("ডেটা রিস্টোর করতে সমস্যা হয়েছে।");
+    } finally {
+      setAiOverlay({ show: false, message: '', step: 0 });
+    }
+  };
+
+  // WhatsApp-style Auto-Backup Logic
+  useEffect(() => {
+    if (settings.autoBackup === 'never' || !isGoogleAuthenticated) return;
+
+    const checkAutoBackup = () => {
+      const lastBackup = settings.lastBackupDate ? parseISO(settings.lastBackupDate) : new Date(0);
+      const now = new Date();
+      
+      const diffMs = now.getTime() - lastBackup.getTime();
+      const diffDays = diffMs / (1000 * 60 * 60 * 24);
+
+      if (settings.autoBackup === 'daily' && diffDays >= 1) {
+        backupToGoogleDrive(true);
+      } else if (settings.autoBackup === 'weekly' && diffDays >= 7) {
+        backupToGoogleDrive(true);
+      }
+    };
+
+    const timer = setTimeout(checkAutoBackup, 5000); // Check 5 seconds after mount
+    return () => clearTimeout(timer);
+  }, [settings.autoBackup, isGoogleAuthenticated]);
+  const exportLocalBackup = () => {
+    const content = JSON.stringify({ logs, settings, exportedAt: new Date().toISOString() }, null, 2);
+    const blob = new Blob([content], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `cyber_rider_local_${format(new Date(), 'yyyy-MM-dd')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importLocalBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const data = JSON.parse(event.target?.result as string);
+        if (data.logs && data.settings) {
+          setConfirmModal({
+            show: true,
+            title: 'Import Success! ✅',
+            message: 'ফাইল থেকে ডেটা পাওয়া গেছে। আপনি কি আপনার বর্তমান ডেটা বর্তমান এই ফাইল দিয়ে রিপ্লেস করতে চান?',
+            onConfirm: () => {
+              setLogs(data.logs);
+              setSettings(s => ({ ...s, ...data.settings }));
+              setConfirmModal(prev => ({ ...prev, show: false }));
+              alert("ডেটা রিস্টোর সম্পন্ন হয়েছে!");
+            },
+            type: 'info'
+          });
+        }
+      } catch (err) {
+        alert("ভুল ফাইল ফরম্যাট! অনুগ্রহ করে সঠিক JSON ফাইল সিলেক্ট করুন।");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = ''; // Reset input
+  };
+
   const fetchDynamicInsight = useCallback(async () => {
     if (filteredLogs.length === 0 || isInsightLoading) return;
     
@@ -379,20 +688,85 @@ export default function App() {
     setNotificationPermission(permission);
   };
 
+  const playSynthBeep = useCallback((volume = 0.5) => {
+    try {
+      const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextClass) return;
+      
+      const ctx = new AudioContextClass();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(800, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(1200, ctx.currentTime + 0.1);
+      
+      gain.gain.setValueAtTime(volume, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.2);
+      
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      
+      osc.start();
+      osc.stop(ctx.currentTime + 0.2);
+    } catch (e) {
+      console.error("Synth beep error:", e);
+    }
+  }, []);
+
   const playNotificationSound = useCallback(() => {
-    if (!settings.notificationSound) return;
-    const audio = new Audio(settings.notificationSound);
+    const soundUrl = settings.notificationSound;
+    
+    if (!soundUrl || soundUrl === 'synth') {
+      playSynthBeep(settings.notificationVolume);
+      return;
+    }
+
+    const audio = new Audio(soundUrl);
     audio.volume = settings.notificationVolume;
-    audio.play().catch(err => console.error("Sound play error:", err));
-  }, [settings.notificationSound, settings.notificationVolume]);
+    
+    // Removing crossOrigin as it can cause "no supported source" errors if CORS is not correctly configured on the server
+    const playPromise = audio.play();
+    
+    if (playPromise !== undefined) {
+      playPromise.catch(err => {
+        // Silent fail for autoplay restrictions
+        if (err.name !== 'NotAllowedError') {
+          console.error("Sound play error (Source:", soundUrl, "):", err);
+          // Fallback to synth if external file fails
+          playSynthBeep(settings.notificationVolume);
+        }
+      });
+    }
+  }, [settings.notificationSound, settings.notificationVolume, playSynthBeep]);
+
+  const initializeSystem = () => {
+    setIsSystemInitialized(true);
+    // Play a startup sound to unlock audio context
+    playNotificationSound();
+  };
 
   const sendNotification = useCallback((title: string, body: string) => {
     playNotificationSound();
     if (notificationPermission === 'granted') {
-      new Notification(title, {
-        body,
-        icon: 'https://picsum.photos/seed/rocket/128/128'
-      });
+      // Use Service Worker for background/lock screen support if available
+      if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.ready.then(registration => {
+          registration.showNotification(title, {
+            body,
+            icon: 'https://api.dicebear.com/7.x/bottts/svg?seed=commander-1',
+            vibrate: [200, 100, 200],
+            tag: 'cyber-rider-alert',
+            renotify: true
+          } as any);
+        });
+      } else {
+        // Fallback to standard notification
+        new Notification(title, {
+          body,
+          icon: 'https://api.dicebear.com/7.x/bottts/svg?seed=commander-1'
+        });
+      }
     }
   }, [notificationPermission, playNotificationSound]);
 
@@ -400,10 +774,19 @@ export default function App() {
   useEffect(() => {
     const checkTime = () => {
       const now = new Date();
+      const todayStr = format(now, 'yyyy-MM-dd');
+
+      // Skip holidays
+      if (settings.holidays?.includes(todayStr)) return;
+
       const currentTime = format(now, 'HH:mm');
       
       // Trigger if current time is >= shift time AND shift hasn't been marked as started
       if (currentTime >= settings.shiftTime && !isShiftActive && !aiOverlay.show) {
+        // Prevent trigger if already logged today
+        const alreadyLogged = logs.some(l => l.date === todayStr);
+        if (alreadyLogged) return;
+
         sendNotification("Shift Reminder 🚨", "বস, অফিসের সময় হয়ে গেছে! দ্রুত বের হন।");
         setAiOverlay({
           show: true,
@@ -444,7 +827,7 @@ export default function App() {
   }, [stats.totalDel, settings.target, sendNotification]);
 
   // --- Handlers ---
-  const handleSaveEntry = () => {
+  const handleSaveEntry = async () => {
     setFormError(null);
 
     if (!formData.date) {
@@ -466,27 +849,32 @@ export default function App() {
       return;
     }
 
-    const newEntry: LogEntry = {
-      id: editingId || crypto.randomUUID(),
+    const entry: any = {
+      uid: user?.uid,
       date: formData.date,
       count,
       advance,
-      extraLeave
+      extraLeave,
+      createdAt: new Date().toISOString()
     };
 
-    if (editingId) {
-      setLogs(prev => prev.map(log => log.id === editingId ? newEntry : log));
-      setEditingId(null);
-    } else {
-      setLogs(prev => [...prev, newEntry]);
+    try {
+      if (editingId) {
+        await updateDoc(doc(db, 'logs', editingId), entry);
+        setEditingId(null);
+      } else {
+        await addDoc(collection(db, 'logs'), entry);
+      }
+      setFormData({
+        date: format(new Date(), 'yyyy-MM-dd'),
+        count: '',
+        advance: '',
+        extraLeave: ''
+      });
+    } catch (error) {
+      console.error("Log Submit Error:", error);
+      setFormError("ডেটা সেভ করতে সমস্যা হয়েছে।");
     }
-
-    setFormData({
-      date: format(new Date(), 'yyyy-MM-dd'),
-      count: '',
-      advance: '',
-      extraLeave: ''
-    });
   };
 
   const handleEdit = (log: LogEntry) => {
@@ -522,9 +910,13 @@ export default function App() {
       title: "ডিলিট নিশ্চিত করুন",
       message: `${format(parseISO(logToDelete.date), 'dd MMMM')} এর সকল তথ্য কি স্থায়ীভাবে মুছে ফেলতে চান?`,
       type: 'delete',
-      onConfirm: () => {
-        setLogs(prev => prev.filter(log => log.id !== id));
-        setConfirmModal(prev => ({ ...prev, show: false }));
+      onConfirm: async () => {
+        try {
+          await deleteDoc(doc(db, 'logs', id));
+          setConfirmModal(prev => ({ ...prev, show: false }));
+        } catch (error) {
+          console.error("Delete Error:", error);
+        }
       }
     });
   };
@@ -601,8 +993,59 @@ export default function App() {
           </div>
         </div>
 
+        <AnimatePresence>
+          {(!isSystemInitialized || isAuthLoading || !user) && (
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-[100] bg-bg-dark/95 backdrop-blur-md flex flex-col items-center justify-center p-8 text-center"
+            >
+              <motion.div 
+                animate={{ 
+                  scale: [1, 1.1, 1],
+                  rotate: [0, 5, -5, 0]
+                }}
+                transition={{ duration: 4, repeat: Infinity }}
+                className="mb-8"
+              >
+                <Rocket className="w-16 h-16 text-neon-blue drop-shadow-[0_0_15px_rgba(0,243,255,0.5)]" />
+              </motion.div>
+              
+              <h2 className="text-2xl font-display font-black text-white mb-2 glow-blue uppercase tracking-tighter">
+                {!user ? 'Authentication Required' : 'System Offline'}
+              </h2>
+              <p className="text-text-dim text-xs mb-8 leading-relaxed">
+                {!user 
+                  ? 'আপনার ডেটা ক্লাউডে সুরক্ষিত রাখতে গুগল দিয়ে লগইন করুন।' 
+                  : 'সিস্টেমের অডিও এবং রিয়েল-টাইম অ্যালার্ট সক্রিয় করতে নিচে ক্লিক করুন।'}
+              </p>
+              
+              {!user ? (
+                <button 
+                  onClick={handleLogin}
+                  className="group relative px-8 py-4 bg-white text-black font-black uppercase tracking-widest rounded-xl overflow-hidden hover:scale-105 active:scale-95 transition-all flex items-center gap-2"
+                >
+                  <img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" className="w-5 h-5" alt="Google" />
+                  Login with Google
+                </button>
+              ) : (
+                <button 
+                  onClick={initializeSystem}
+                  className="group relative px-8 py-4 bg-neon-blue text-black font-black uppercase tracking-widest rounded-xl overflow-hidden hover:scale-105 active:scale-95 transition-all"
+                >
+                  <span className="relative z-10 flex items-center gap-2">
+                    Initialize System <Zap className="w-4 h-4" />
+                  </span>
+                  <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300" />
+                </button>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Navbar */}
-        <nav className="h-16 flex items-center justify-between px-6 shrink-0">
+        <nav className="h-16 flex items-center justify-between px-6 shrink-0 border-b border-white/5">
           <div className="flex items-center gap-2">
             <Rocket className="w-5 h-5 text-neon-blue" />
             <span className="font-display font-black text-lg glow-blue tracking-tighter">DEL-PRO AI</span>
@@ -616,6 +1059,77 @@ export default function App() {
             <span className="w-4.5 h-0.5 bg-neon-blue group-hover:w-5 transition-all" />
           </button>
         </nav>
+
+        {/* Manual Drive Setup Modal */}
+        <AnimatePresence>
+          {showManualDriveSetup && (
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-[110] bg-bg-dark/95 backdrop-blur-xl p-8 flex flex-col justify-center"
+            >
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="text-lg font-display font-bold text-neon-blue uppercase">Manual API Setup</h3>
+                <button onClick={() => setShowManualDriveSetup(false)} className="text-text-dim hover:text-white">
+                  <X />
+                </button>
+              </div>
+
+              <div className="space-y-4">
+                <div className="bg-neon-blue/10 border border-neon-blue/20 p-4 rounded-2xl mb-4">
+                  <p className="text-[10px] text-neon-blue font-bold leading-relaxed">
+                    AI Studio এর সিক্রেটস কাজ না করলে এখানে আপনার নিজিস্ব Google API Keys দিন। এগুলো আপনার ডিভাইসে সেভ থাকবে।
+                  </p>
+                </div>
+
+                <div>
+                  <label className="text-[10px] font-bold uppercase tracking-widest text-text-dim mb-2 block">Google Client ID</label>
+                  <input 
+                    type="text"
+                    value={manualDriveKeys.clientId}
+                    onChange={(e) => setManualDriveKeys(p => ({ ...p, clientId: e.target.value }))}
+                    placeholder="Enter Client ID..."
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-xs outline-none focus:border-neon-blue"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-[10px] font-bold uppercase tracking-widest text-text-dim mb-2 block">Client Secret</label>
+                  <input 
+                    type="text"
+                    value={manualDriveKeys.clientSecret}
+                    onChange={(e) => setManualDriveKeys(p => ({ ...p, clientSecret: e.target.value }))}
+                    placeholder="Enter Client Secret..."
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-xs outline-none focus:border-neon-blue"
+                  />
+                </div>
+
+                <div className="pt-4 space-y-3">
+                  <button 
+                    onClick={() => {
+                      if (!manualDriveKeys.clientId || !manualDriveKeys.clientSecret) {
+                        alert("অনুগ্রহ করে Client ID এবং Client Secret দুটিই প্রদান করুন।");
+                        return;
+                      }
+                      setShowManualDriveSetup(false);
+                      connectGoogleDrive();
+                    }}
+                    className="w-full py-4 bg-neon-blue text-black font-black uppercase tracking-widest text-xs rounded-xl shadow-[0_0_20px_rgba(0,243,255,0.3)] hover:scale-[1.02] active:scale-95 transition-all"
+                  >
+                    Save & Connect
+                  </button>
+                  <button 
+                    onClick={() => window.open('https://console.cloud.google.com/', '_blank')}
+                    className="w-full py-3 border border-white/10 text-[10px] font-bold uppercase tracking-widest text-text-dim rounded-xl"
+                  >
+                    API Console Guide
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Scrollable App Body */}
         <div className="flex-1 overflow-y-auto px-5 pb-24 scrollbar-hide">
@@ -814,7 +1328,7 @@ export default function App() {
                     <tr key={log.id} className={cn("group transition-colors", idx % 2 === 0 ? "bg-white/[0.02]" : "bg-white/[0.05]")}>
                       <td className="py-3 px-2 font-mono text-text-dim">{format(parseISO(log.date), 'dd/MM')}</td>
                       <td className="py-3 px-2 text-center font-bold text-neon-blue">{log.count}</td>
-                      <td className="py-3 px-2 text-center font-bold text-neon-blue">{log.count * DELIVERY_RATE}৳</td>
+                      <td className="py-3 px-2 text-center font-bold text-neon-blue">{log.count * settings.deliveryRate}৳</td>
                       <td className="py-3 px-2 text-right">
                         <div className="flex justify-end gap-1">
                           <button onClick={() => handleEdit(log)} className="p-1.5 bg-white/5 rounded-lg hover:text-neon-blue transition-colors">
@@ -838,7 +1352,7 @@ export default function App() {
                     <tr className="bg-neon-blue/5">
                       <td className="py-3 px-2 font-bold uppercase text-neon-blue">Total</td>
                       <td className="py-3 px-2 text-center font-bold text-neon-blue">{stats.totalDel}</td>
-                      <td className="py-3 px-2 text-center font-bold text-neon-blue">{stats.totalDel * DELIVERY_RATE}৳</td>
+                      <td className="py-3 px-2 text-center font-bold text-neon-blue">{stats.totalDel * settings.deliveryRate}৳</td>
                       <td className="py-3 px-2"></td>
                     </tr>
                   </tfoot>
@@ -900,7 +1414,7 @@ export default function App() {
                   {filteredLogs.filter(l => l.extraLeave > 0).sort((a,b) => b.date.localeCompare(a.date)).map((log, idx) => (
                     <tr key={log.id} className={cn("group transition-colors", idx % 2 === 0 ? "bg-white/[0.02]" : "bg-white/[0.05]")}>
                       <td className="py-3 px-2 font-mono text-text-dim">{format(parseISO(log.date), 'dd/MM')}</td>
-                      <td className="py-3 px-2 text-center font-bold text-neon-red">{log.extraLeave * LEAVE_FINE_RATE}৳</td>
+                      <td className="py-3 px-2 text-center font-bold text-neon-red">{Math.round(log.extraLeave * (settings.baseSalary / 30))}৳</td>
                       <td className="py-3 px-2 text-right">
                         <div className="flex justify-end gap-1">
                           <button onClick={() => handleEdit(log)} className="p-1.5 bg-white/5 rounded-lg hover:text-neon-blue transition-colors">
@@ -1024,6 +1538,36 @@ export default function App() {
                 </div>
               </div>
 
+              <div className="glass border-white/5 p-6 rounded-[2rem] mb-6">
+                <h3 className="text-xs font-bold uppercase tracking-widest text-neon-blue mb-4">Salary Configuration</h3>
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-text-dim mb-1.5 block">Base Salary (৳)</label>
+                    <input 
+                      type="number" 
+                      value={settings.baseSalary}
+                      onChange={(e) => setSettings(s => ({ ...s, baseSalary: parseInt(e.target.value) || 0 }))}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-neon-blue/50 transition-colors"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-text-dim mb-1.5 block">Delivery Rate (৳ per order)</label>
+                    <input 
+                      type="number" 
+                      value={settings.deliveryRate}
+                      onChange={(e) => setSettings(s => ({ ...s, deliveryRate: parseInt(e.target.value) || 0 }))}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-neon-blue/50 transition-colors"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-text-dim mb-1.5 block">Leave Fine (Auto-calculated)</label>
+                    <div className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-neon-red font-bold">
+                      {Math.round(settings.baseSalary / 30)} ৳ <span className="text-[10px] text-text-dim font-normal">(Salary / 30 per day)</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div>
                 <label className="text-xs font-bold uppercase tracking-widest text-text-dim mb-2 block">Monthly Target</label>
                 <input 
@@ -1052,13 +1596,203 @@ export default function App() {
                 />
               </div>
 
+              <div className="glass border-white/5 p-6 rounded-[2rem] mb-6">
+                <h3 className="text-xs font-bold uppercase tracking-widest text-neon-purple mb-4">Holiday Settings 🗓️</h3>
+                <div className="space-y-4">
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-text-dim block">Add Official Holiday Range (Eid, Puja, Xmas etc.)</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[8px] font-bold uppercase text-text-dim mb-1 block">From</label>
+                        <input 
+                          type="date" 
+                          id="holiday-start-date"
+                          className="w-full bg-white/5 border border-white/30 rounded-xl px-3 py-2 text-[10px] outline-none focus:border-neon-purple/50 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[8px] font-bold uppercase text-text-dim mb-1 block">To (Optional)</label>
+                        <input 
+                          type="date" 
+                          id="holiday-end-date"
+                          className="w-full bg-white/5 border border-white/30 rounded-xl px-3 py-2 text-[10px] outline-none focus:border-neon-purple/50 transition-colors"
+                        />
+                      </div>
+                    </div>
+                    <button 
+                      onClick={() => {
+                        const startInput = document.getElementById('holiday-start-date') as HTMLInputElement;
+                        const endInput = document.getElementById('holiday-end-date') as HTMLInputElement;
+                        const start = startInput.value;
+                        const end = endInput.value || start;
+                        
+                        if (start) {
+                          const startDate = parseISO(start);
+                          const endDate = parseISO(end);
+                          
+                          try {
+                            const days = eachDayOfInterval({ start: startDate, end: endDate });
+                            const newDates = days.map(d => format(d, 'yyyy-MM-dd'));
+                            
+                            setSettings(s => ({
+                              ...s,
+                              holidays: Array.from(new Set([...(s.holidays || []), ...newDates])).sort()
+                            }));
+                            
+                            startInput.value = '';
+                            endInput.value = '';
+                          } catch (e) {
+                            console.error("Invalid interval", e);
+                          }
+                        }
+                      }}
+                      className="w-full bg-neon-purple text-white py-2.5 rounded-xl text-xs font-bold shadow-[0_0_20px_rgba(188,19,254,0.3)] hover:scale-[1.02] active:scale-95 transition-all flex items-center justify-center gap-2"
+                    >
+                      <Plus className="w-4 h-4" /> Add Holiday Range
+                    </button>
+                  </div>
+                  
+                  {(settings.holidays || []).length > 0 && (
+                    <div className="space-y-2 max-h-40 overflow-y-auto pr-2 scrollbar-thin">
+                      {settings.holidays.map(hStr => (
+                        <div key={hStr} className="flex justify-between items-center bg-white/5 border border-white/5 px-3 py-2 rounded-lg group">
+                          <span className="text-[10px] font-mono font-bold text-neon-purple">{format(parseISO(hStr), 'dd MMMM yyyy')}</span>
+                          <button 
+                            onClick={() => setSettings(s => ({ ...s, holidays: s.holidays.filter(h => h !== hStr) }))}
+                            className="text-white/30 hover:text-neon-red transition-colors group-hover:opacity-100"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <p className="text-[9px] text-text-dim italic">
+                    💡 নির্ধারিত ছুটির দিনে কোনো জরিমানা করা হবে না।
+                  </p>
+                </div>
+              </div>
+
               <div className="pt-4 space-y-3">
                 {settingsError && (
                   <p className="text-[10px] text-neon-red font-bold text-center mb-2">⚠️ {settingsError}</p>
                 )}
+
+                {/* WhatsApp Style Backup Settings */}
+                <div className="glass border-white/5 p-6 rounded-[2rem] mb-2">
+                  <div className="flex items-center gap-3 mb-6">
+                    <div className="w-10 h-10 bg-neon-purple/20 rounded-xl flex items-center justify-center">
+                      <Cloud className="w-6 h-6 text-neon-purple" />
+                    </div>
+                    <div>
+                      <h3 className="text-xs font-bold uppercase tracking-widest text-neon-purple leading-none">Google Drive Backup</h3>
+                      <p className="text-[9px] text-text-dim mt-1">Snapshot your data to the cloud</p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div className="bg-white/5 p-4 rounded-2xl border border-white/5">
+                      <div className="flex justify-between items-center mb-1">
+                        <span className="text-[9px] font-bold uppercase tracking-wider text-text-dim">Last Backup</span>
+                        <span className="text-[9px] font-mono text-neon-purple">
+                          {settings.lastBackupSize || '0 KB'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-white font-medium">
+                        {settings.lastBackupDate 
+                          ? format(parseISO(settings.lastBackupDate), 'PPp') 
+                          : 'Never backed up'}
+                      </p>
+                      
+                      <div className="grid grid-cols-2 gap-2 mt-4">
+                        <button 
+                          onClick={() => backupToGoogleDrive()}
+                          disabled={isBackingUp}
+                          className="py-2.5 bg-neon-purple text-black font-black uppercase tracking-widest text-[9px] rounded-xl hover:scale-[1.02] active:scale-95 transition-all flex items-center justify-center gap-1.5"
+                        >
+                          {isBackingUp ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <HardDrive className="w-3.5 h-3.5" />}
+                          Back Up
+                        </button>
+                        <button 
+                          onClick={restoreFromGoogleDrive}
+                          className="py-2.5 bg-white/5 border border-white/10 text-white font-bold uppercase tracking-wider text-[9px] rounded-xl hover:bg-white/10 transition-all flex items-center justify-center gap-1.5"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          Restore
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-3 px-1">
+                      <div className="flex justify-between items-center">
+                        <label className="text-[10px] font-bold uppercase tracking-widest text-text-dim">Frequency</label>
+                        <select 
+                          value={settings.autoBackup}
+                          onChange={(e) => setSettings(s => ({ ...s, autoBackup: e.target.value as any }))}
+                          className="bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-[10px] text-white outline-none focus:border-neon-purple/50"
+                        >
+                          <option value="never">Never</option>
+                          <option value="daily">Daily</option>
+                          <option value="weekly">Weekly</option>
+                        </select>
+                      </div>
+
+                      <div className="flex justify-between items-center pt-2 border-t border-white/5">
+                        <label className="text-[10px] font-bold uppercase tracking-widest text-text-dim">Account</label>
+                        <span className="text-[9px] text-neon-blue truncate max-w-[100px] text-right">
+                          {isGoogleAuthenticated ? (user?.email || 'Connected') : 'Not connected'}
+                        </span>
+                      </div>
+                      
+                      {!isGoogleAuthenticated && (
+                        <button 
+                          onClick={connectGoogleDrive}
+                          className="w-full py-2 border border-dashed border-neon-blue/40 text-neon-blue text-[9px] font-bold uppercase rounded-xl hover:bg-neon-blue/5 transition-all mb-2"
+                        >
+                          Connect Google Drive
+                        </button>
+                      )}
+
+                      <button 
+                        onClick={() => setShowManualDriveSetup(true)}
+                        className="w-full py-2 bg-white/5 border border-white/10 text-text-dim text-[9px] font-bold uppercase rounded-xl hover:text-white transition-all"
+                      >
+                        {isGoogleAuthenticated ? 'Update API Keys' : 'Manual API Setup'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Local Backup Fallback */}
+                <div className="glass border-white/5 p-6 rounded-[2rem] mb-2">
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="w-10 h-10 bg-neon-green/20 rounded-xl flex items-center justify-center">
+                      <Download className="w-6 h-6 text-neon-green" />
+                    </div>
+                    <div>
+                      <h3 className="text-xs font-bold uppercase tracking-widest text-neon-green leading-none">Local Backup</h3>
+                      <p className="text-[9px] text-text-dim mt-1">Export data to your device</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button 
+                      onClick={exportLocalBackup}
+                      className="py-2.5 bg-neon-green/10 border border-neon-green/30 text-neon-green font-black uppercase tracking-widest text-[9px] rounded-xl hover:bg-neon-green/20 transition-all flex items-center justify-center gap-1.5"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Export
+                    </button>
+                    <label className="py-2.5 bg-white/5 border border-white/10 text-white font-bold uppercase tracking-wider text-[10px] rounded-xl hover:bg-white/10 transition-all flex items-center justify-center gap-1.5 cursor-pointer">
+                      <Plus className="w-3.5 h-3.5" />
+                      Import
+                      <input type="file" accept=".json" onChange={importLocalBackup} className="hidden" />
+                    </label>
+                  </div>
+                </div>
+
                 <div className="glass border-white/5 p-4 rounded-2xl mb-2">
                   <div className="flex justify-between items-center mb-2">
-                    <span className="text-[10px] font-bold uppercase text-text-dim">Cloud Sync</span>
+                    <span className="text-[10px] font-bold uppercase text-text-dim">Real-time Sync</span>
                     <span className={cn(
                       "text-[10px] font-bold uppercase px-2 py-0.5 rounded-full",
                       syncStatus === 'synced' ? "bg-neon-green/20 text-neon-green" :
@@ -1123,9 +1857,10 @@ export default function App() {
                         onChange={(e) => setSettings(s => ({ ...s, notificationSound: e.target.value }))}
                         className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs outline-none focus:border-neon-blue/50"
                       >
-                        <option value="https://cdn.pixabay.com/audio/2022/03/15/audio_78390a3607.mp3">Futuristic Beep</option>
-                        <option value="https://cdn.pixabay.com/audio/2021/08/04/audio_0625c1539c.mp3">Cyber Alert</option>
-                        <option value="https://cdn.pixabay.com/audio/2022/03/10/audio_c8c8a73053.mp3">Digital Chime</option>
+                        <option value="synth">Neon Synth (Internal)</option>
+                        <option value="https://assets.mixkit.co/active_storage/sfx/2568/2568-preview.mp3">Futuristic Beep</option>
+                        <option value="https://assets.mixkit.co/active_storage/sfx/2571/2571-preview.mp3">Cyber Alert</option>
+                        <option value="https://assets.mixkit.co/active_storage/sfx/2565/2565-preview.mp3">Digital Chime</option>
                       </select>
                     </div>
                     
@@ -1147,9 +1882,29 @@ export default function App() {
 
                     <button 
                       onClick={playNotificationSound}
-                      className="w-full py-2 bg-neon-blue/10 border border-neon-blue/30 rounded-xl text-[10px] font-bold uppercase text-neon-blue hover:bg-neon-blue/20 transition-all"
+                      className="w-full py-2 bg-neon-blue/10 border border-neon-blue/30 rounded-xl text-[10px] font-bold uppercase text-neon-blue hover:bg-neon-blue/20 transition-all mb-2"
                     >
                       Test Sound
+                    </button>
+
+                    <button 
+                      onClick={() => {
+                        setSettings(s => ({ 
+                          ...s, 
+                          notificationSound: 'https://assets.mixkit.co/active_storage/sfx/2568/2568-preview.mp3',
+                          notificationVolume: 0.5
+                        }));
+                        setConfirmModal({
+                          show: true,
+                          title: 'Settings Reset ⚡',
+                          message: 'অডিও সেটিংস ডিফল্টে রিসেট করা হয়েছে।',
+                          onConfirm: () => setConfirmModal(prev => ({ ...prev, show: false })),
+                          type: 'info'
+                        });
+                      }}
+                      className="w-full py-2 bg-white/5 border border-white/10 rounded-xl text-[10px] font-bold uppercase text-text-dim hover:text-white transition-all"
+                    >
+                      Reset Sound to Defaults
                     </button>
                   </div>
                 </div>
@@ -1199,6 +1954,14 @@ export default function App() {
                   <span>Export CSV Report</span>
                   <Download className="w-5 h-5" />
                 </button>
+
+                <button 
+                  onClick={handleSidebarLogout}
+                  className="w-full flex items-center justify-between bg-neon-red/10 border border-neon-red/30 px-4 py-4 rounded-2xl hover:bg-neon-red/20 transition-colors text-neon-red font-bold"
+                >
+                  <span>Logout</span>
+                  <LogOut className="w-5 h-5" />
+                </button>
               </div>
             </div>
           </motion.div>
@@ -1224,14 +1987,20 @@ export default function App() {
             >
               <div className={cn(
                 "w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-6 border",
-                confirmModal.type === 'delete' ? "bg-neon-red/10 border-neon-red/50 text-neon-red" : "bg-neon-blue/10 border-neon-blue/50 text-neon-blue"
+                confirmModal.type === 'delete' ? "bg-neon-red/10 border-neon-red/50 text-neon-red" : 
+                confirmModal.type === 'setup' ? "bg-neon-purple/10 border-neon-purple/50 text-neon-purple" :
+                "bg-neon-blue/10 border-neon-blue/50 text-neon-blue"
               )}>
-                {confirmModal.type === 'delete' ? <Trash2 className="w-8 h-8" /> : <Edit2 className="w-8 h-8" />}
+                {confirmModal.type === 'delete' ? <Trash2 className="w-8 h-8" /> : 
+                 confirmModal.type === 'setup' ? <Settings className="w-8 h-8" /> :
+                 <Edit2 className="w-8 h-8" />}
               </div>
               
               <h2 className={cn(
                 "text-2xl font-display font-black uppercase mb-4 tracking-tight",
-                confirmModal.type === 'delete' ? "text-neon-red" : "text-neon-blue"
+                confirmModal.type === 'delete' ? "text-neon-red" : 
+                confirmModal.type === 'setup' ? "text-neon-purple" :
+                "text-neon-blue"
               )}>
                 {confirmModal.title}
               </h2>
@@ -1251,10 +2020,12 @@ export default function App() {
                   onClick={confirmModal.onConfirm}
                   className={cn(
                     "text-black font-bold py-3 rounded-2xl shadow-lg hover:scale-105 transition-all",
-                    confirmModal.type === 'delete' ? "bg-neon-red" : "bg-neon-blue"
+                    confirmModal.type === 'delete' ? "bg-neon-red" : 
+                    confirmModal.type === 'setup' ? "bg-neon-purple" :
+                    "bg-neon-blue"
                   )}
                 >
-                  নিশ্চিত করুন
+                  {confirmModal.type === 'setup' ? 'গাইড দেখুন' : 'নিশ্চিত করুন'}
                 </button>
               </div>
             </motion.div>
@@ -1298,14 +2069,21 @@ export default function App() {
                 <button 
                   onClick={() => {
                     const today = format(new Date(), 'yyyy-MM-dd');
-                    const fineEntry: LogEntry = {
-                      id: crypto.randomUUID(),
-                      date: today,
-                      count: 0,
-                      advance: 0,
-                      extraLeave: 1
-                    };
-                    setLogs(prev => [...prev, fineEntry]);
+                    // Prevent double fine on same day
+                    const alreadyFined = logs.some(l => l.date === today && l.extraLeave > 0);
+                    
+                    if (!alreadyFined) {
+                      const fineEntry: any = {
+                        uid: user?.uid,
+                        date: today,
+                        count: 0,
+                        advance: 0,
+                        extraLeave: 1,
+                        createdAt: new Date().toISOString()
+                      };
+                      addDoc(collection(db, 'logs'), fineEntry).catch(console.error);
+                    }
+                    
                     setIsShiftActive(true);
                     setAiOverlay({ show: false, message: '', step: 0 });
                   }}
