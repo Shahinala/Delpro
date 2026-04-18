@@ -21,6 +21,7 @@ app.use(session({
   secret: process.env.SESSION_SECRET || "cyber-rider-secret",
   resave: false,
   saveUninitialized: true,
+  proxy: true,
   cookie: { 
     secure: true, 
     sameSite: 'none',
@@ -55,6 +56,29 @@ const getOAuth2Client = (req: express.Request) => {
     clientSecret,
     getRedirectUri(req)
   );
+};
+
+// Helper to get tokens from session OR header (fallback for iframe/cookie issues)
+const getTokens = (req: express.Request) => {
+  const sessionTokens = (req as any).session.tokens;
+  if (sessionTokens) {
+    console.log("Tokens found in session.");
+    return sessionTokens;
+  }
+
+  const headerTokens = req.headers['x-google-tokens'];
+  if (headerTokens && typeof headerTokens === 'string') {
+    try {
+      console.log("Tokens found in X-Google-Tokens header.");
+      return JSON.parse(headerTokens);
+    } catch (e) {
+      console.error("Error parsing X-Google-Tokens header:", e);
+      return null;
+    }
+  }
+  
+  console.log("No tokens found in session or headers.");
+  return null;
 };
 
 // API Routes
@@ -102,6 +126,7 @@ app.get("/auth/google/callback", async (req, res) => {
     const { tokens } = await oauth2Client.getToken(code as string);
     // Store tokens in session
     (req as any).session.tokens = tokens;
+    const tokensJson = JSON.stringify(tokens);
     
     res.send(`
       <html>
@@ -112,7 +137,10 @@ app.get("/auth/google/callback", async (req, res) => {
             <p style="color: #888; font-size: 14px;">গুগল ড্রাইভ সফলভাবে সংযুক্ত হয়েছে। এই উইন্ডোটি অটোমেটিক বন্ধ হয়ে যাবে।</p>
             <script>
               if (window.opener) {
-                window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS' }, '*');
+                window.opener.postMessage({ 
+                  type: 'GOOGLE_AUTH_SUCCESS',
+                  tokens: ${tokensJson}
+                }, '*');
                 setTimeout(() => window.close(), 1500);
               }
             </script>
@@ -143,13 +171,29 @@ app.get("/auth/google/callback", async (req, res) => {
 
 // 3. Check Auth Status
 app.get("/api/auth/google/status", (req, res) => {
-  const tokens = (req as any).session.tokens;
+  const tokens = getTokens(req);
   res.json({ isAuthenticated: !!tokens });
 });
 
-// 4. Backup to Google Drive
+// 4. Set Session from Client Tokens (Persistence)
+app.post("/api/auth/google/session", (req, res) => {
+  const { tokens } = req.body;
+  if (!tokens) return res.status(400).json({ error: "No tokens provided" });
+  (req as any).session.tokens = tokens;
+  
+  // Explicitly save session to ensure it persists in MemoryStore before responding
+  req.session.save((err) => {
+    if (err) {
+      console.error("Session save error:", err);
+      return res.status(500).json({ error: "Session save failed" });
+    }
+    res.json({ status: "Session restored" });
+  });
+});
+
+// 5. Backup to Google Drive
 app.post("/api/backup/google-drive", async (req, res) => {
-  const tokens = (req as any).session.tokens;
+  const tokens = getTokens(req);
   if (!tokens) {
     return res.status(401).json({ error: "Not authenticated with Google" });
   }
@@ -159,6 +203,14 @@ app.post("/api/backup/google-drive", async (req, res) => {
   try {
     const oauth2Client = getOAuth2Client(req);
     oauth2Client.setCredentials(tokens);
+    
+    // Listen for token refreshes
+    let refreshedTokens: any = null;
+    oauth2Client.on('tokens', (newTokens) => {
+      refreshedTokens = { ...tokens, ...newTokens };
+      (req as any).session.tokens = refreshedTokens;
+    });
+
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
     // Search for existing backup file
@@ -169,17 +221,18 @@ app.post("/api/backup/google-drive", async (req, res) => {
     });
 
     const existingFile = response.data.files?.[0];
+    let result: any = {};
 
     if (existingFile) {
       // Update existing file
-      await drive.files.update({
+      const updateRes = await drive.files.update({
         fileId: existingFile.id!,
         media: {
           mimeType: 'application/json',
           body: JSON.stringify(data, null, 2),
         },
       });
-      res.json({ message: "Backup updated successfully", fileId: existingFile.id });
+      result = { message: "Backup updated successfully", fileId: existingFile.id };
     } else {
       // Create new file
       const fileMetadata = {
@@ -195,17 +248,29 @@ app.post("/api/backup/google-drive", async (req, res) => {
         media: media,
         fields: 'id',
       });
-      res.json({ message: "Backup created successfully", fileId: file.data.id });
+      result = { message: "Backup created successfully", fileId: file.data.id };
     }
-  } catch (error) {
+
+    if (refreshedTokens) {
+      result.newTokens = refreshedTokens;
+    }
+    
+    res.json(result);
+  } catch (error: any) {
     console.error("Drive Backup Error:", error);
-    res.status(500).json({ error: "Failed to backup to Google Drive" });
+    if (error.code === 401 || (error.response && error.response.status === 401)) {
+      return res.status(401).json({ error: "গুগল ড্রাইভ অথেন্টিকেশন এক্সপায়ার হয়েছে। দয়া করে পুনরায় কানেক্ট করুন।" });
+    }
+    if (error.code === 403 || (error.response && error.response.status === 403)) {
+      return res.status(403).json({ error: "গুগল ড্রাইভ পারমিশন ইরর! দয়া করে আপনার ড্রাইভ স্টোরেজ চেক করুন।" });
+    }
+    res.status(500).json({ error: "ব্যাকআপ করতে সমস্যা হয়েছে: " + (error.message || "Unknown Error") });
   }
 });
 
 // 5. Restore from Google Drive
 app.get("/api/backup/google-drive/restore", async (req, res) => {
-  const tokens = (req as any).session.tokens;
+  const tokens = getTokens(req);
   if (!tokens) {
     return res.status(401).json({ error: "Not authenticated with Google" });
   }
@@ -215,6 +280,14 @@ app.get("/api/backup/google-drive/restore", async (req, res) => {
   try {
     const oauth2Client = getOAuth2Client(req);
     oauth2Client.setCredentials(tokens);
+
+    // Listen for token refreshes
+    let refreshedTokens: any = null;
+    oauth2Client.on('tokens', (newTokens) => {
+      refreshedTokens = { ...tokens, ...newTokens };
+      (req as any).session.tokens = refreshedTokens;
+    });
+
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
     // Search for backup file
@@ -236,16 +309,28 @@ app.get("/api/backup/google-drive/restore", async (req, res) => {
       alt: 'media',
     });
 
-    res.json({ 
+    const result: any = { 
       data: fileContent.data,
       info: {
         size: existingFile.size,
         modifiedTime: existingFile.modifiedTime
       }
-    });
-  } catch (error) {
+    };
+
+    if (refreshedTokens) {
+      result.newTokens = refreshedTokens;
+    }
+
+    res.json(result);
+  } catch (error: any) {
     console.error("Drive Restore Error:", error);
-    res.status(500).json({ error: "Failed to restore from Google Drive" });
+    if (error.code === 401 || (error.response && error.response.status === 401)) {
+      return res.status(401).json({ error: "গুগল ড্রাইভ অথেন্টিকেশন এক্সপায়ার হয়েছে। দয়া করে পুনরায় কানেক্ট করুন।" });
+    }
+    if (error.status === 404) {
+      return res.status(404).json({ error: "আপনার গুগল ড্রাইভে কোনো ব্যাকআপ ফাইল পাওয়া যায়নি।" });
+    }
+    res.status(500).json({ error: "রিস্টোর করতে সমস্যা হয়েছে: " + (error.message || "Unknown Error") });
   }
 });
 

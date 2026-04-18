@@ -24,8 +24,6 @@ export const AIChat: React.FC<AIChatProps> = ({ logs, settings, onClose }) => {
   const [isMinimized, setIsMinimized] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -35,12 +33,19 @@ export const AIChat: React.FC<AIChatProps> = ({ logs, settings, onClose }) => {
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
 
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      setMessages(prev => [...prev, { role: 'model', text: "দুঃখিত, Gemini API Key সেট করা নেই। দয়া করে সেটিংস থেকে কি (Key) সেট করুন।" }]);
+      return;
+    }
+
     const userMessage = input.trim();
     setInput('');
     setMessages(prev => [...prev, { role: 'user', text: userMessage }]);
     setIsLoading(true);
 
     try {
+      const ai = new GoogleGenAI({ apiKey });
       const systemInstruction = `
         You are "DEL-PRO AI", a futuristic delivery assistant for a rider named ${settings.userName}.
         The rider's current role is ${settings.userRole}.
@@ -56,7 +61,7 @@ export const AIChat: React.FC<AIChatProps> = ({ logs, settings, onClose }) => {
       `;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-flash-latest",
         contents: [
           ...messages.map(m => ({ role: m.role, parts: [{ text: m.text }] })),
           { role: 'user', parts: [{ text: userMessage }] }
@@ -69,9 +74,13 @@ export const AIChat: React.FC<AIChatProps> = ({ logs, settings, onClose }) => {
 
       const aiText = response.text || "দুঃখিত বস, আমার সিস্টেমে একটু সমস্যা হচ্ছে। আবার চেষ্টা করবেন?";
       setMessages(prev => [...prev, { role: 'model', text: aiText }]);
-    } catch (error) {
+    } catch (error: any) {
       console.error("AI Chat Error:", error);
-      setMessages(prev => [...prev, { role: 'model', text: "কানেকশন লস্ট! দয়া করে আপনার ইন্টারনেট চেক করুন।" }]);
+      if (error?.message?.includes('403') || error?.message?.includes('permission')) {
+        setMessages(prev => [...prev, { role: 'model', text: "API পারমিশন এরর! দয়া করে আপনার Google AI Studio সেটিংস চেক করুন।" }]);
+      } else {
+        setMessages(prev => [...prev, { role: 'model', text: "কানেকশন লস্ট! দয়া করে আপনার ইন্টারনেট চেক করুন।" }]);
+      }
     } finally {
       setIsLoading(false);
     }
