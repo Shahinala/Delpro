@@ -58,29 +58,6 @@ const getOAuth2Client = (req: express.Request) => {
   );
 };
 
-// Helper to get tokens from session OR header (fallback for iframe/cookie issues)
-const getTokens = (req: express.Request) => {
-  const sessionTokens = (req as any).session.tokens;
-  if (sessionTokens) {
-    console.log("Tokens found in session.");
-    return sessionTokens;
-  }
-
-  const headerTokens = req.headers['x-google-tokens'];
-  if (headerTokens && typeof headerTokens === 'string') {
-    try {
-      console.log("Tokens found in X-Google-Tokens header.");
-      return JSON.parse(headerTokens);
-    } catch (e) {
-      console.error("Error parsing X-Google-Tokens header:", e);
-      return null;
-    }
-  }
-  
-  console.log("No tokens found in session or headers.");
-  return null;
-};
-
 // API Routes
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
@@ -171,7 +148,7 @@ app.get("/auth/google/callback", async (req, res) => {
 
 // 3. Check Auth Status
 app.get("/api/auth/google/status", (req, res) => {
-  const tokens = getTokens(req);
+  const tokens = (req as any).session.tokens;
   res.json({ isAuthenticated: !!tokens });
 });
 
@@ -193,7 +170,10 @@ app.post("/api/auth/google/session", (req, res) => {
 
 // 5. Backup to Google Drive
 app.post("/api/backup/google-drive", async (req, res) => {
-  const tokens = getTokens(req);
+  const sessionTokens = (req as any).session.tokens;
+  const bodyTokens = req.body.googleTokens;
+  const tokens = sessionTokens || bodyTokens;
+
   if (!tokens) {
     return res.status(401).json({ error: "Not authenticated with Google" });
   }
@@ -203,14 +183,6 @@ app.post("/api/backup/google-drive", async (req, res) => {
   try {
     const oauth2Client = getOAuth2Client(req);
     oauth2Client.setCredentials(tokens);
-    
-    // Listen for token refreshes
-    let refreshedTokens: any = null;
-    oauth2Client.on('tokens', (newTokens) => {
-      refreshedTokens = { ...tokens, ...newTokens };
-      (req as any).session.tokens = refreshedTokens;
-    });
-
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
     // Search for existing backup file
@@ -221,18 +193,17 @@ app.post("/api/backup/google-drive", async (req, res) => {
     });
 
     const existingFile = response.data.files?.[0];
-    let result: any = {};
 
     if (existingFile) {
       // Update existing file
-      const updateRes = await drive.files.update({
+      await drive.files.update({
         fileId: existingFile.id!,
         media: {
           mimeType: 'application/json',
           body: JSON.stringify(data, null, 2),
         },
       });
-      result = { message: "Backup updated successfully", fileId: existingFile.id };
+      res.json({ message: "Backup updated successfully", fileId: existingFile.id });
     } else {
       // Create new file
       const fileMetadata = {
@@ -248,29 +219,30 @@ app.post("/api/backup/google-drive", async (req, res) => {
         media: media,
         fields: 'id',
       });
-      result = { message: "Backup created successfully", fileId: file.data.id };
+      res.json({ message: "Backup created successfully", fileId: file.data.id });
     }
-
-    if (refreshedTokens) {
-      result.newTokens = refreshedTokens;
-    }
-    
-    res.json(result);
   } catch (error: any) {
     console.error("Drive Backup Error:", error);
-    if (error.code === 401 || (error.response && error.response.status === 401)) {
-      return res.status(401).json({ error: "গুগল ড্রাইভ অথেন্টিকেশন এক্সপায়ার হয়েছে। দয়া করে পুনরায় কানেক্ট করুন।" });
-    }
-    if (error.code === 403 || (error.response && error.response.status === 403)) {
-      return res.status(403).json({ error: "গুগল ড্রাইভ পারমিশন ইরর! দয়া করে আপনার ড্রাইভ স্টোরেজ চেক করুন।" });
-    }
-    res.status(500).json({ error: "ব্যাকআপ করতে সমস্যা হয়েছে: " + (error.message || "Unknown Error") });
+    res.status(500).json({ error: error.message || "Failed to backup to Google Drive" });
   }
 });
 
 // 5. Restore from Google Drive
 app.get("/api/backup/google-drive/restore", async (req, res) => {
-  const tokens = getTokens(req);
+  const sessionTokens = (req as any).session.tokens;
+  const headerTokensRaw = req.headers['x-google-tokens'];
+  let headerTokens = null;
+  
+  if (headerTokensRaw && typeof headerTokensRaw === 'string') {
+    try {
+      headerTokens = JSON.parse(headerTokensRaw);
+    } catch (e) {
+      console.error("Failed to parse tokens from header");
+    }
+  }
+  
+  const tokens = sessionTokens || headerTokens;
+
   if (!tokens) {
     return res.status(401).json({ error: "Not authenticated with Google" });
   }
@@ -280,14 +252,6 @@ app.get("/api/backup/google-drive/restore", async (req, res) => {
   try {
     const oauth2Client = getOAuth2Client(req);
     oauth2Client.setCredentials(tokens);
-
-    // Listen for token refreshes
-    let refreshedTokens: any = null;
-    oauth2Client.on('tokens', (newTokens) => {
-      refreshedTokens = { ...tokens, ...newTokens };
-      (req as any).session.tokens = refreshedTokens;
-    });
-
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
     // Search for backup file
@@ -309,28 +273,16 @@ app.get("/api/backup/google-drive/restore", async (req, res) => {
       alt: 'media',
     });
 
-    const result: any = { 
+    res.json({ 
       data: fileContent.data,
       info: {
         size: existingFile.size,
         modifiedTime: existingFile.modifiedTime
       }
-    };
-
-    if (refreshedTokens) {
-      result.newTokens = refreshedTokens;
-    }
-
-    res.json(result);
-  } catch (error: any) {
+    });
+  } catch (error) {
     console.error("Drive Restore Error:", error);
-    if (error.code === 401 || (error.response && error.response.status === 401)) {
-      return res.status(401).json({ error: "গুগল ড্রাইভ অথেন্টিকেশন এক্সপায়ার হয়েছে। দয়া করে পুনরায় কানেক্ট করুন।" });
-    }
-    if (error.status === 404) {
-      return res.status(404).json({ error: "আপনার গুগল ড্রাইভে কোনো ব্যাকআপ ফাইল পাওয়া যায়নি।" });
-    }
-    res.status(500).json({ error: "রিস্টোর করতে সমস্যা হয়েছে: " + (error.message || "Unknown Error") });
+    res.status(500).json({ error: "Failed to restore from Google Drive" });
   }
 });
 

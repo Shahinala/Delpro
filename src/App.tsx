@@ -174,80 +174,13 @@ export default function App() {
   const [dynamicAiInsight, setDynamicAiInsight] = useState("সিস্টেম প্রস্তুত। আপনার প্রথম এন্ট্রিটি যোগ করুন।");
   const [isInsightLoading, setIsInsightLoading] = useState(false);
   const [isGoogleAuthenticated, setIsGoogleAuthenticated] = useState(false);
-  const [googleTokens, setGoogleTokens] = useState<any>(() => {
-    const saved = localStorage.getItem('google_tokens');
-    return saved ? JSON.parse(saved) : null;
-  });
+  const [googleTokens, setGoogleTokens] = useState<any>(null);
   const [isBackingUp, setIsBackingUp] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [isSystemInitialized, setIsSystemInitialized] = useState(false);
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
-  const [toasts, setToasts] = useState<{ id: string; message: string; type: 'error' | 'success' | 'info'; duration?: number }[]>([]);
-
-  const addToast = useCallback((message: string, type: 'error' | 'success' | 'info' = 'info', duration = 3000) => {
-    const id = Math.random().toString(36).substring(2, 9);
-    setToasts(prev => [...prev, { id, message, type, duration }]);
-    if (duration !== Infinity) {
-      setTimeout(() => {
-        setToasts(prev => prev.filter(t => t.id !== id));
-      }, duration);
-    }
-  }, []);
-
-  const removeToast = (id: string) => {
-    setToasts(prev => prev.filter(t => t.id !== id));
-  };
-
-  // Centralized API handler
-  const apiCall = useCallback(async (url: string, options: RequestInit = {}, timeout = 10000) => {
-    if (!navigator.onLine) {
-      throw new Error("ইন্টারনেট সংযোগ বিচ্ছিন্ন! দয়া করে আপনার কানেকশন চেক করুন।");
-    }
-
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-
-    try {
-      const savedTokens = localStorage.getItem('google_tokens');
-      const tokensToUse = googleTokens || (savedTokens ? JSON.parse(savedTokens) : null);
-      
-      const headers = { ...options.headers } as any;
-      if (tokensToUse) headers['x-google-tokens'] = JSON.stringify(tokensToUse);
-      
-      const res = await fetch(url, {
-        ...options,
-        headers,
-        signal: controller.signal,
-        credentials: 'include'
-      });
-      clearTimeout(id);
-
-      const data = await res.json().catch(() => ({}));
-
-      if (!res.ok) {
-        if (res.status === 401) {
-          throw { status: 401, message: "গুগল অথেন্টিকেশন ল্যাপস হয়েছে।", data };
-        }
-        if (res.status === 404) {
-          throw { status: 404, message: "সার্ভারে ডাটা খুঁজে পাওয়া যায়নি।", data };
-        }
-        if (res.status >= 500) {
-          throw { status: 500, message: "সার্ভারে সমস্যা হয়েছে! দয়া করে কিছুক্ষণ পর চেষ্টা করুন।", data };
-        }
-        throw { status: res.status, message: data.error || "অজানা সমস্যা হয়েছে।", data };
-      }
-
-      return data;
-    } catch (err: any) {
-      clearTimeout(id);
-      if (err.name === 'AbortError') {
-        throw new Error("রিকোয়েস্ট টাইমআউট হয়েছে! সার্ভার রেসপন্স করছে না।");
-      }
-      throw err;
-    }
-  }, [googleTokens]);
 
   const [activeSettingsSection, setActiveSettingsSection] = useState<string | null>(null);
   const [confirmModal, setConfirmModal] = useState<{
@@ -302,14 +235,6 @@ export default function App() {
       setSettings(s => ({ ...s, notificationSound: 'https://assets.mixkit.co/active_storage/sfx/2568/2568-preview.mp3' }));
     }
   }, [settings]);
-
-  useEffect(() => {
-    if (googleTokens) {
-      localStorage.setItem('google_tokens', JSON.stringify(googleTokens));
-    } else {
-      localStorage.removeItem('google_tokens');
-    }
-  }, [googleTokens]);
 
   // --- Firebase Auth & Data Sync ---
   useEffect(() => {
@@ -428,66 +353,65 @@ export default function App() {
     
     try {
       if (isGoogleAuthenticated) {
-        const data = await apiCall('/api/backup/google-drive', {
-          method: 'POST',
-          body: JSON.stringify({
-            data: { logs, settings },
-            fileName: `cyber_rider_backup_${user?.uid || 'user'}.json`
-          })
-        }).catch(async (err) => {
-          if (err.status === 401 && !isRetry && user) {
-            console.warn("Unauthorized sync, attempting restoration with local/cloud tokens...");
-            const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
-            const tokens = tokenDoc.exists() ? tokenDoc.data().tokens : null;
-
-            if (tokens) {
-              setGoogleTokens(tokens);
-              const restoreRes = await fetch('/api/auth/google/session', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'include',
-                body: JSON.stringify({ tokens })
-              });
-              if (restoreRes.ok) {
-                await syncWithCloud(true);
-                return null;
-              }
-            }
-            setIsGoogleAuthenticated(false);
-            setGoogleTokens(null);
-            localStorage.removeItem('google_tokens');
-            addToast("গুগল ড্রাইভ অথেন্টিকেশন ল্যাপস! দয়া করে সেটিংস থেকে Repair করুন।", 'error');
-            throw err;
-          }
-          throw err;
-        });
-        
-        if (!data) return;
-
-        if (data.newTokens) {
-          setGoogleTokens(data.newTokens);
-          localStorage.setItem('google_tokens', JSON.stringify(data.newTokens));
-          if (user) {
-            setDoc(doc(db, 'google_tokens', user.uid), { 
-              tokens: data.newTokens,
-              updatedAt: new Date().toISOString()
-            }, { merge: true }).catch(console.error);
+        // Real sync with Google Drive
+        let currentTokens = googleTokens;
+        if (!currentTokens && user) {
+          const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
+          if (tokenDoc.exists()) {
+            currentTokens = tokenDoc.data().tokens;
+            setGoogleTokens(currentTokens);
           }
         }
+
+        const res = await fetch('/api/backup/google-drive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            data: { logs, settings },
+            fileName: `cyber_rider_backup_${user?.uid || 'user'}.json`,
+            googleTokens: currentTokens
+          })
+        });
+        
+        if (res.status === 401 && !isRetry && user) {
+          console.warn("Unauthorized, attempting session restoration...");
+          const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
+          if (tokenDoc.exists()) {
+            const tokens = tokenDoc.data().tokens;
+            setGoogleTokens(tokens);
+            const restoreRes = await fetch('/api/auth/google/session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              credentials: 'include',
+              body: JSON.stringify({ tokens })
+            });
+            if (restoreRes.ok) {
+              return syncWithCloud(true);
+            }
+          }
+          setIsGoogleAuthenticated(false);
+          throw new Error("গুগল ড্রাইভ কানেকশন লস্ট!");
+        }
+
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => ({}));
+          throw new Error(errorData.error || "Drive sync failed");
+        }
       } else {
-        await new Promise(resolve => setTimeout(resolve, 800));
+        // Simulated sync if Google is not connected
+        await new Promise(resolve => setTimeout(resolve, 1500));
       }
       
       const now = new Date().toISOString();
       setLastSynced(now);
       localStorage.setItem('lastSynced', now);
       setSyncStatus('synced');
-    } catch (err: any) {
+    } catch (err) {
       console.error("Sync error:", err);
       setSyncStatus('offline');
-      addToast(err.message || "সিঙ্ক করতে সমস্যা হয়েছে।", 'error');
     }
-  }, [isOnline, syncStatus, isGoogleAuthenticated, logs, settings, googleTokens, user, apiCall, addToast]);
+  }, [isOnline, syncStatus, isGoogleAuthenticated, googleTokens, logs, settings, user]);
 
   // Auto-sync when coming back online or when data changes
   useEffect(() => {
@@ -550,7 +474,11 @@ export default function App() {
   useEffect(() => {
     const checkGoogleAuth = async (retries = 3) => {
       try {
-        const data = await apiCall('/api/auth/google/status');
+        const res = await fetch('/api/auth/google/status', {
+          credentials: 'include'
+        });
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+        const data = await res.json();
         
         if (!data.isAuthenticated && user) {
           // If not authenticated on server, try to restore from Firestore
@@ -558,26 +486,32 @@ export default function App() {
           if (tokenDoc.exists()) {
             const tokens = tokenDoc.data().tokens;
             setGoogleTokens(tokens);
-            const restoreData = await apiCall('/api/auth/google/session', {
+            const restoreRes = await fetch('/api/auth/google/session', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
+              credentials: 'include',
               body: JSON.stringify({ tokens })
             });
-            if (restoreData.status === "Session restored") {
+            if (restoreRes.ok) {
               setIsGoogleAuthenticated(true);
               return;
             }
           }
+        } else if (data.isAuthenticated && user && !googleTokens) {
+          // If authenticated on server but tokens missing locally, fetch from Firestore
+          const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
+          if (tokenDoc.exists()) {
+            setGoogleTokens(tokenDoc.data().tokens);
+          }
         }
         
         setIsGoogleAuthenticated(data.isAuthenticated);
-      } catch (err: any) {
+      } catch (err) {
         if (retries > 0) {
           console.warn(`Auth check failed, retrying... (${retries} left)`);
           setTimeout(() => checkGoogleAuth(retries - 1), 2000);
         } else {
-          console.error("Auth check failed after retries:", err);
-          setIsGoogleAuthenticated(false);
+          console.error("Auth check error after retries:", err);
         }
       }
     };
@@ -591,7 +525,6 @@ export default function App() {
         setIsGoogleAuthenticated(true);
         if (event.data.tokens) {
           setGoogleTokens(event.data.tokens);
-          localStorage.setItem('google_tokens', JSON.stringify(event.data.tokens));
         }
         
         // Persist tokens to Firestore for future sessions
@@ -602,16 +535,20 @@ export default function App() {
           });
         }
         
-        addToast("গুগল ড্রাইভ সফলভাবে সংযুক্ত হয়েছে! ✅", 'success');
+        alert("গুগল ড্রাইভ সফলভাবে সংযুক্ত হয়েছে!");
       }
     };
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [user, isAuthLoading, addToast]);
+  }, [user, isAuthLoading]);
 
   const connectGoogleDrive = async () => {
     try {
-      const data = await apiCall('/api/auth/google/url');
+      const res = await fetch('/api/auth/google/url', {
+        credentials: 'include'
+      });
+      const data = await res.json();
+
       const { url } = data;
       
       const width = 600;
@@ -626,15 +563,15 @@ export default function App() {
       );
 
       if (!authWindow || authWindow.closed || typeof authWindow.closed === 'undefined') {
-        addToast("পপ-আপ ব্লক করা হয়েছে! অনুগ্রহ করে ব্রাউজারের পপ-আপ সেটিংস চেক করুন।", 'error');
+        alert("পপ-আপ ব্লক করা হয়েছে! অনুগ্রহ করে ব্রাউজারের পপ-আপ সেটিংস চেক করুন।");
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error("Connect error:", err);
-      addToast(err.message || "গুগল ড্রাইভের সাথে সংযোগ করা যায়নি।", 'error');
+      alert("গুগল ড্রাইভের সাথে সংযোগ করতে সমস্যা হচ্ছে। আবার চেষ্টা করুন।");
     }
   };
 
-  const backupToGoogleDrive = useCallback(async (isAuto = false, isRetry = false) => {
+  const backupToGoogleDrive = async (isAuto = false, isRetry = false) => {
     if (!isGoogleAuthenticated) {
       if (!isAuto) connectGoogleDrive();
       return;
@@ -642,75 +579,78 @@ export default function App() {
 
     setIsBackingUp(true);
     try {
-      const data = await apiCall('/api/backup/google-drive', {
+      let currentTokens = googleTokens;
+      if (!currentTokens && user) {
+        const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
+        if (tokenDoc.exists()) {
+          currentTokens = tokenDoc.data().tokens;
+          setGoogleTokens(currentTokens);
+        }
+      }
+
+      const res = await fetch('/api/backup/google-drive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           data: { logs, settings },
-          fileName: `cyber_rider_backup_${user?.uid || 'user'}.json`
+          fileName: `cyber_rider_backup_${user?.uid || 'user'}.json`,
+          googleTokens: currentTokens
         })
-      }).catch(async (err) => {
-        if (err.status === 401 && !isRetry && user) {
-          console.warn("Unauthorized backup, attempting restoration with local/cloud tokens...");
-          const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
-          const tokens = tokenDoc.exists() ? tokenDoc.data().tokens : null;
-
-          if (tokens) {
-            setGoogleTokens(tokens);
-            const restoreRes = await fetch('/api/auth/google/session', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              credentials: 'include',
-              body: JSON.stringify({ tokens })
-            });
-            if (restoreRes.ok) {
-              await backupToGoogleDrive(isAuto, true);
-              return null;
-            }
-          }
-          setIsGoogleAuthenticated(false);
-          setGoogleTokens(null);
-          localStorage.removeItem('google_tokens');
-          addToast("গুগল ড্রাইভ অথেন্টিকেশন ল্যাপস! দয়া করে পুনরায় কানেক্ট করুন।", 'error');
-          throw err;
-        }
-        throw err;
       });
 
-      if (!data) return;
-
-      if (data.newTokens) {
-        setGoogleTokens(data.newTokens);
-        localStorage.setItem('google_tokens', JSON.stringify(data.newTokens));
-        if (user) {
-          setDoc(doc(db, 'google_tokens', user.uid), { 
-            tokens: data.newTokens,
-            updatedAt: new Date().toISOString()
-          }, { merge: true }).catch(console.error);
+      if (res.status === 401 && !isRetry && user) {
+        console.warn("Unauthorized backup, attempting session restoration...");
+        const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
+        if (tokenDoc.exists()) {
+          const tokens = tokenDoc.data().tokens;
+          setGoogleTokens(tokens);
+          const restoreRes = await fetch('/api/auth/google/session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ tokens })
+          });
+          if (restoreRes.ok) {
+            return backupToGoogleDrive(isAuto, true);
+          }
         }
+        setIsGoogleAuthenticated(false);
+        throw new Error("গুগল ড্রাইভ কানেকশন লস্ট!");
       }
 
-      const now = new Date().toISOString();
-      const size = `${(JSON.stringify({ logs, settings }).length / 1024).toFixed(1)} KB`;
-      
-      setSettings(s => ({
-        ...s,
-        lastBackupDate: now,
-        lastBackupSize: size
-      }));
-      
-      if (!isAuto) {
-        addToast("সফলভাবে ক্লাউডে ব্যাকআপ করা হয়েছে! ☁️", 'success');
+      const data = await res.json();
+      if (res.ok) {
+        const now = new Date().toISOString();
+        const size = `${(JSON.stringify({ logs, settings }).length / 1024).toFixed(1)} KB`;
+        
+        setSettings(s => ({
+          ...s,
+          lastBackupDate: now,
+          lastBackupSize: size
+        }));
+        
+        if (!isAuto) {
+          setConfirmModal({
+            show: true,
+            title: 'Backup Successful! ☁️',
+            message: 'আপনার সকল ডেটা গুগল ড্রাইভে ব্যাকআপ করা হয়েছে।',
+            onConfirm: () => setConfirmModal(prev => ({ ...prev, show: false })),
+            type: 'info'
+          });
+        }
+      } else {
+        throw new Error(data.error);
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error("Backup error:", err);
-      if (!isAuto) addToast(err.message || "ব্যাকআপ ব্যর্থ হয়েছে!", 'error');
+      if (!isAuto) alert("ব্যাকআপ করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।");
     } finally {
       setIsBackingUp(false);
     }
-  }, [isGoogleAuthenticated, googleTokens, logs, settings, user, apiCall, addToast]);
+  };
 
-  const restoreFromGoogleDrive = useCallback(async (isRetry = false) => {
+  const restoreFromGoogleDrive = async (isRetry = false) => {
     if (!isGoogleAuthenticated) {
       connectGoogleDrive();
       return;
@@ -718,70 +658,70 @@ export default function App() {
 
     setAiOverlay({ show: true, message: 'রিপোরিং ডেটা ফ্রম ক্লাউড...', step: 0 });
     try {
-      const data = await apiCall(`/api/backup/google-drive/restore?fileName=cyber_rider_backup_${user?.uid || 'user'}.json`)
-        .catch(async (err) => {
-          if (err.status === 401 && !isRetry && user) {
-            console.warn("Unauthorized restore, attempting restoration with local/cloud tokens...");
-            const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
-            const tokens = tokenDoc.exists() ? tokenDoc.data().tokens : null;
-
-            if (tokens) {
-              setGoogleTokens(tokens);
-              const restoreRes = await fetch('/api/auth/google/session', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'include',
-                body: JSON.stringify({ tokens })
-              });
-              if (restoreRes.ok) {
-                await restoreFromGoogleDrive(true);
-                return null;
-              }
-            }
-            setIsGoogleAuthenticated(false);
-            setGoogleTokens(null);
-            localStorage.removeItem('google_tokens');
-            addToast("গুগল ড্রাইভ লগইন এক্সপায়ার হয়েছে!", 'error');
-            throw err;
-          }
-          throw err;
-        });
-      
-      if (!data) return;
-      
-      if (data.newTokens) {
-        setGoogleTokens(data.newTokens);
-        localStorage.setItem('google_tokens', JSON.stringify(data.newTokens));
-        if (user) {
-          setDoc(doc(db, 'google_tokens', user.uid), { 
-            tokens: data.newTokens,
-            updatedAt: new Date().toISOString()
-          }, { merge: true }).catch(console.error);
+      let currentTokens = googleTokens;
+      if (!currentTokens && user) {
+        const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
+        if (tokenDoc.exists()) {
+          currentTokens = tokenDoc.data().tokens;
+          setGoogleTokens(currentTokens);
         }
       }
 
-      const { logs: restoredLogs, settings: restoredSettings } = data.data;
-      
-      setConfirmModal({
-        show: true,
-        title: 'Restore Backup? 💾',
-        message: `একটি ব্যাকআপ পাওয়া গেছে (${data.info.size} bytes, ${format(parseISO(data.info.modifiedTime), 'PPp')})। আপনি কি আপনার বর্তমান ডেটা বর্তমান এই ফাইল দিয়ে রিপ্লেস করতে চান?`,
-        onConfirm: () => {
-          setLogs(restoredLogs);
-          setSettings(s => ({ ...s, ...restoredSettings }));
-          setSyncStatus('synced');
-          setConfirmModal(prev => ({ ...prev, show: false }));
-          addToast("ডেটা রিস্টোর সম্পন্ন হয়েছে! ✅", 'success');
+      const res = await fetch(`/api/backup/google-drive/restore?fileName=cyber_rider_backup_${user?.uid || 'user'}.json`, {
+        headers: {
+          'x-google-tokens': currentTokens ? JSON.stringify(currentTokens) : ''
         },
-        type: 'info'
+        credentials: 'include'
       });
-    } catch (err: any) {
+      
+      if (res.status === 401 && !isRetry && user) {
+        console.warn("Unauthorized restore, attempting session restoration...");
+        const tokenDoc = await getDoc(doc(db, 'google_tokens', user.uid));
+        if (tokenDoc.exists()) {
+          const tokens = tokenDoc.data().tokens;
+          setGoogleTokens(tokens);
+          const restoreRes = await fetch('/api/auth/google/session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ tokens })
+          });
+          if (restoreRes.ok) {
+            return restoreFromGoogleDrive(true);
+          }
+        }
+        setIsGoogleAuthenticated(false);
+        throw new Error("গুগল ড্রাইভ কানেকশন লস্ট!");
+      }
+
+      const data = await res.json();
+      
+      if (res.ok) {
+        const { logs: restoredLogs, settings: restoredSettings } = data.data;
+        
+        setConfirmModal({
+          show: true,
+          title: 'Restore Backup? 💾',
+          message: `একটি ব্যাকআপ পাওয়া গেছে (${data.info.size} bytes, ${format(parseISO(data.info.modifiedTime), 'PPp')})। আপনি কি এটি লোকাল ডেটা দিয়ে রিপ্লেস করতে চান?`,
+          onConfirm: () => {
+            setLogs(restoredLogs);
+            setSettings(s => ({ ...s, ...restoredSettings }));
+            setConfirmModal(prev => ({ ...prev, show: false }));
+            setAiOverlay({ show: true, message: 'ডেটা রিস্টোর সম্পন্ন হয়েছে! রিফ্রেশ হচ্ছে...', step: 100 });
+            setTimeout(() => setAiOverlay({ show: false, message: '', step: 0 }), 2000);
+          },
+          type: 'info'
+        });
+      } else {
+        alert("কোনো ব্যাকআপ ফাইল খুঁজে পাওয়া যায়নি।");
+      }
+    } catch (err) {
       console.error("Restore error:", err);
-      addToast(err.message || "ডেটা রিস্টোর ব্যর্থ হয়েছে!", 'error');
+      alert("ডেটা রিস্টোর করতে সমস্যা হয়েছে।");
     } finally {
       setAiOverlay({ show: false, message: '', step: 0 });
     }
-  }, [isGoogleAuthenticated, googleTokens, user, apiCall, addToast]);
+  };
 
   // WhatsApp-style Auto-Backup Logic
   useEffect(() => {
@@ -849,7 +789,7 @@ export default function App() {
     if (filteredLogs.length === 0 || isInsightLoading) return;
     
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
+    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
       console.warn("Gemini API Key is not configured.");
       setDynamicAiInsight("আপনার সেটিংস থেকে Gemini API Key সেট করুন AI ফিচারের জন্য।");
       return;
@@ -1990,33 +1930,12 @@ export default function App() {
                               </span>
                             </div>
                             
-                            {!isGoogleAuthenticated ? (
+                            {!isGoogleAuthenticated && (
                               <button 
                                 onClick={connectGoogleDrive}
-                                className="w-full py-2 border border-dashed border-neon-blue/40 text-neon-blue text-[9px] font-bold uppercase rounded-xl hover:bg-neon-blue/5 transition-all mt-2"
+                                className="w-full py-2 border border-dashed border-neon-blue/40 text-neon-blue text-[9px] font-bold uppercase rounded-xl hover:bg-neon-blue/5 transition-all"
                               >
                                 Connect Google Drive
-                              </button>
-                            ) : (
-                              <button 
-                                onClick={() => {
-                                  setConfirmModal({
-                                    show: true,
-                                    title: 'Repair Sync? 🛠️',
-                                    message: 'এর মাধ্যমে আপনার গুগল কানেকশন রিসেট করা হবে। এটি সিংক্রোনাইজেশন সমস্যা সমাধানে সাহায্য করে। আপনি কি নিশ্চিত?',
-                                    onConfirm: () => {
-                                      setIsGoogleAuthenticated(false);
-                                      setGoogleTokens(null);
-                                      localStorage.removeItem('google_tokens');
-                                      setConfirmModal(prev => ({ ...prev, show: false }));
-                                      setTimeout(connectGoogleDrive, 500);
-                                    },
-                                    type: 'delete'
-                                  });
-                                }}
-                                className="w-full py-2 border border-dashed border-neon-red/40 text-neon-red text-[9px] font-bold uppercase rounded-xl hover:bg-neon-red/5 transition-all mt-2"
-                              >
-                                Repair Sync Connection
                               </button>
                             )}
                           </div>
@@ -2368,35 +2287,6 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* Toast Notifications */}
-      <div className="fixed top-24 right-4 z-[100] flex flex-col gap-2 pointer-events-none md:top-4">
-        <AnimatePresence>
-          {toasts.map(toast => (
-            <motion.div
-              key={toast.id}
-              initial={{ opacity: 0, x: 50, scale: 0.9 }}
-              animate={{ opacity: 1, x: 0, scale: 1 }}
-              exit={{ opacity: 0, x: 20, scale: 0.9 }}
-              className={cn(
-                "pointer-events-auto flex items-center gap-3 px-4 py-3 rounded-2xl shadow-2xl border backdrop-blur-xl min-w-[280px] max-w-sm",
-                toast.type === 'error' ? "bg-neon-red/20 border-neon-red/30 text-neon-red ring-1 ring-neon-red/20" :
-                toast.type === 'success' ? "bg-neon-green/20 border-neon-green/30 text-neon-green ring-1 ring-neon-green/20" :
-                "bg-neon-blue/20 border-neon-blue/30 text-neon-blue ring-1 ring-neon-blue/20"
-              )}
-            >
-              <div className="flex-1 text-[11px] font-bold uppercase tracking-wider">{toast.message}</div>
-              <button 
-                onClick={() => removeToast(toast.id)}
-                className="p-1.5 hover:bg-white/10 rounded-xl transition-colors"
-                aria-label="Close notification"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </motion.div>
-          ))}
-        </AnimatePresence>
-      </div>
     </div>
   );
 }

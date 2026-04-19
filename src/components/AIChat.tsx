@@ -34,7 +34,7 @@ export const AIChat: React.FC<AIChatProps> = ({ logs, settings, onClose }) => {
     if (!input.trim() || isLoading) return;
 
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
+    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
       setMessages(prev => [...prev, { role: 'model', text: "দুঃখিত, Gemini API Key সেট করা নেই। দয়া করে সেটিংস থেকে কি (Key) সেট করুন।" }]);
       return;
     }
